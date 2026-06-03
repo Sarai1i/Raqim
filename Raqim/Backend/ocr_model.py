@@ -1,17 +1,16 @@
-"""OCR engine for Raqim with Qari OCR support.
+"""محرك OCR الخاص بمنصة Raqim — يعتمد على Tesseract v5 فقط.
 
-This module keeps the interface expected by ``Backend/app.py``:
+هذا الملف يوفّر الواجهة التي يتوقعها ``Backend/app.py``:
 
-- ``configure_tesseract(tesseract_cmd)`` configures the Tesseract executable.
-- ``ocr_with_highlighting(file_path, output_folder)`` converts PDF/image input into
-  page images and returns OCR words with bounding boxes and confidence highlighting.
+- ``configure_tesseract(tesseract_cmd)`` لضبط مسار تنفيذ Tesseract.
+- ``ocr_with_highlighting(file_path, output_folder)`` لتحويل ملفات PDF/الصور إلى
+  صور صفحات، ثم إرجاع كلمات OCR مع صناديق الإحداثيات (bounding_box) وقيم الثقة
+  (confidence) المطلوبة لتظليل الكلمات منخفضة الثقة في صفحة المراجعة.
 
-Tesseract OCR is the active OCR engine for Raqim. It is configured to use both
-Arabic and English when the language packs are available, and it returns the
-word-level bounding boxes and confidence values required by the existing Raqim
-review workflow: yellow highlighting for low-confidence words and synchronized
-word-to-box selection on the source document. Qari support is kept in this file
-as an optional provider, but it is disabled by default.
+المحرك الوحيد المستخدم هنا هو Tesseract v5، ومضبوط افتراضيًا على العربية
+والإنجليزية معًا (``ara+eng``) عند توفّر حزم اللغة. الملف متوافق مع Windows:
+يقرأ مسار Tesseract من متغير البيئة أو يبحث عنه في المسارات الافتراضية، ويدعم
+تمرير مسار Poppler لقراءة ملفات PDF على Windows.
 """
 
 from __future__ import annotations
@@ -19,8 +18,9 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import tempfile
+import sys
 from pathlib import Path
+from statistics import median
 from typing import Dict, List
 
 from pdf2image import convert_from_path
@@ -29,40 +29,41 @@ import pytesseract
 from pytesseract import Output
 
 
+# الصيغ المدعومة للصور، وإعدادات OCR القابلة للضبط عبر متغيرات البيئة.
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 DEFAULT_DPI = int(os.getenv("OCR_PDF_DPI", "220"))
 DEFAULT_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "80"))
 
-# Qari settings are kept optional only. Raqim now defaults to Tesseract so user
-# files are processed locally with Arabic+English language packs and without
-# depending on the public Hugging Face ZeroGPU quota.
-QARI_OCR_ENABLED = os.getenv("QARI_OCR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-QARI_OCR_PROVIDER = os.getenv("QARI_OCR_PROVIDER", "space").strip().lower()
-QARI_OCR_FALLBACK_TO_TESSERACT = os.getenv("QARI_OCR_FALLBACK_TO_TESSERACT", "false").lower() in {"1", "true", "yes", "on"}
-QARI_SPACE_ID = os.getenv("QARI_SPACE_ID", "oddadmix/Arabic-OCR-Models-Demos")
-QARI_SPACE_API_NAME = os.getenv("QARI_SPACE_API_NAME", "/perform_ocr")
-QARI_SPACE_MODEL_CHOICE = os.getenv("QARI_SPACE_MODEL_CHOICE", "Qari OCR 0.2.2.1")
-QARI_APPROX_CONFIDENCE = float(os.getenv("QARI_APPROX_CONFIDENCE", "95"))
-
-# Documented model identifiers for deployments with enough GPU memory. The current
-# implementation uses the Space/API path by default because local inference was too
-# heavy for this demo machine. These variables are intentionally kept here so the
-# engine can be configured consistently later.
-QARI_LOCAL_MODEL_NAME = os.getenv("QARI_LOCAL_MODEL_NAME", "NAMAA-Space/Qari-OCR-v0.3-VL-2B-Instruct")
-QARI_LATEST_MODEL_NAME = os.getenv("QARI_LATEST_MODEL_NAME", "NAMAA-Space/Qari-OCR-0.4.0-VL-4B-Instruct")
+# مسارات Windows الافتراضية لتثبيت Tesseract v5 (تُستخدم عند عدم توفّره في PATH).
+_WINDOWS_TESSERACT_PATHS = [
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+]
 
 
-_GRADIO_CLIENT = None
-
-
+# configure_tesseract: ضبط مسار تنفيذ Tesseract المستخدم في كل عمليات OCR.
 def configure_tesseract(tesseract_cmd: str | None = None) -> None:
-    """Configure the Tesseract executable used by the active OCR path."""
+    """تحديد ملف tesseract التنفيذي.
+
+    ترتيب البحث: الوسيط الممرَّر، ثم متغير البيئة ``TESSERACT_CMD``، ثم البحث
+    في ``PATH``، وأخيرًا المسارات الافتراضية على Windows. هذا يضمن عمل المحرك
+    على Windows مع Tesseract v5 دون تعديل الكود.
+    """
 
     candidate = tesseract_cmd or os.getenv("TESSERACT_CMD") or shutil.which("tesseract")
+
+    # احتياط خاص بـ Windows عند عدم إضافة Tesseract إلى متغير PATH.
+    if not candidate and sys.platform.startswith("win"):
+        for windows_path in _WINDOWS_TESSERACT_PATHS:
+            if os.path.exists(windows_path):
+                candidate = windows_path
+                break
+
     if candidate:
         pytesseract.pytesseract.tesseract_cmd = candidate
 
 
+# _available_tesseract_languages: إرجاع مجموعة حزم اللغة المثبتة في Tesseract.
 def _available_tesseract_languages() -> set[str]:
     try:
         langs = pytesseract.get_languages(config="")
@@ -71,7 +72,14 @@ def _available_tesseract_languages() -> set[str]:
         return set()
 
 
+# _preferred_language: اختيار لغة OCR، مع تفضيل العربية والإنجليزية معًا.
 def _preferred_language() -> str:
+    """إرجاع لغة Tesseract المناسبة.
+
+    الافتراضي ``ara+eng`` عند توفّر الحزمتين. يمكن فرض لغة محددة عبر متغير
+    البيئة ``OCR_TESSERACT_LANG`` (مثل ``ara`` أو ``ara+eng``).
+    """
+
     configured_lang = os.getenv("OCR_TESSERACT_LANG", "").strip()
     if configured_lang:
         return configured_lang
@@ -86,6 +94,7 @@ def _preferred_language() -> str:
     return "eng"
 
 
+# _prepare_output_folder: تجهيز مجلد الإخراج وحذف معاينات الصفحات القديمة.
 def _prepare_output_folder(output_folder: str | os.PathLike[str]) -> Path:
     folder = Path(output_folder)
     folder.mkdir(parents=True, exist_ok=True)
@@ -98,12 +107,21 @@ def _prepare_output_folder(output_folder: str | os.PathLike[str]) -> Path:
     return folder
 
 
+# _load_pages: تحويل ملف PDF/صورة إلى قائمة صور صفحات بصيغة RGB.
 def _load_pages(file_path: str | os.PathLike[str]) -> List[Image.Image]:
+    """قراءة الملف المدخل وإرجاع صفحاته كصور.
+
+    لملفات PDF يُستخدم Poppler عبر ``pdf2image``. على Windows يمكن تمرير مسار
+    Poppler عبر متغير البيئة ``POPPLER_PATH`` إذا لم يكن مضافًا إلى ``PATH``.
+    """
+
     path = Path(file_path)
     suffix = path.suffix.lower()
 
     if suffix == ".pdf":
-        return [page.convert("RGB") for page in convert_from_path(str(path), dpi=DEFAULT_DPI)]
+        poppler_path = os.getenv("POPPLER_PATH", "").strip() or None
+        pages = convert_from_path(str(path), dpi=DEFAULT_DPI, poppler_path=poppler_path)
+        return [page.convert("RGB") for page in pages]
 
     if suffix in SUPPORTED_IMAGE_EXTENSIONS:
         with Image.open(path) as image:
@@ -112,21 +130,25 @@ def _load_pages(file_path: str | os.PathLike[str]) -> List[Image.Image]:
     raise ValueError(f"Unsupported OCR file type: {suffix or 'unknown'}")
 
 
+# _normalize_for_ocr: تحويل الصورة إلى تدرّج رمادي بتباين تلقائي لتحسين دقة OCR.
 def _normalize_for_ocr(image: Image.Image) -> Image.Image:
     gray = ImageOps.grayscale(image)
     return ImageOps.autocontrast(gray)
 
 
+# _clean_text: تنظيف النص الكامل بإزالة المسافات الزائدة والأسطر الفارغة.
 def _clean_text(text: str) -> str:
     text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.split("\n")]
     return "\n".join(line for line in lines if line).strip()
 
 
+# _clean_word: تنظيف كلمة واحدة بدمج المسافات وإزالة الأطراف.
 def _clean_word(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+# _safe_confidence: تحويل قيمة الثقة إلى رقم عشري آمن (-1 عند الفشل).
 def _safe_confidence(value) -> float:
     try:
         return float(value)
@@ -134,7 +156,14 @@ def _safe_confidence(value) -> float:
         return -1.0
 
 
+# _word_item: بناء عنصر الكلمة الموحّد (نص + ثقة + صندوق إحداثيات + حالة التظليل).
 def _word_item(word: str, confidence: float, x: int, y: int, w: int, h: int, width: int, height: int, index: int) -> Dict:
+    """تكوين قاموس الكلمة المتوافق مع صفحة المراجعة.
+
+    تُظلَّل الكلمة (highlighted) عندما تقل ثقتها عن العتبة الافتراضية، أو عند
+    تعذّر قياس الثقة، حتى ينتبه إليها المستخدم أثناء المراجعة.
+    """
+
     highlighted = confidence < DEFAULT_CONFIDENCE_THRESHOLD if confidence >= 0 else True
     return {
         "index": index,
@@ -156,75 +185,12 @@ def _word_item(word: str, confidence: float, x: int, y: int, w: int, h: int, wid
     }
 
 
-def _get_gradio_client():
-    global _GRADIO_CLIENT
-    if _GRADIO_CLIENT is None:
-        from gradio_client import Client
+# _approximate_words_from_text: توليد صناديق تقريبية لكلمات RTL من نص بلا إحداثيات.
+def _approximate_words_from_text(text: str, width: int, height: int) -> List[Dict]:
+    """احتياط فقط: عند توفّر نص دون صناديق كلمات من Tesseract.
 
-        hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
-        if hf_token:
-            _GRADIO_CLIENT = Client(QARI_SPACE_ID, token=hf_token)
-        else:
-            _GRADIO_CLIENT = Client(QARI_SPACE_ID)
-    return _GRADIO_CLIENT
-
-
-def _qari_space_text(image: Image.Image) -> str:
-    """Extract Arabic page text through a Hugging Face Space running Qari OCR."""
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        temp_path = tmp.name
-    try:
-        image.convert("RGB").save(temp_path, format="PNG")
-        from gradio_client import handle_file
-
-        client = _get_gradio_client()
-        output = client.predict(
-            handle_file(temp_path),
-            QARI_SPACE_MODEL_CHOICE,
-            api_name=QARI_SPACE_API_NAME,
-        )
-        return _clean_text(output)
-    finally:
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
-
-
-def _qari_local_text(_image: Image.Image) -> str:
-    """Placeholder for local Qari inference on GPU-capable deployments.
-
-    The model identifiers are kept configurable above. For this sandbox demo, local
-    inference repeatedly stalled because the 2B/4B VLM had to offload weights to CPU
-    and disk. Raising here allows the automatic fallback policy to choose the stable
-    Space path or Tesseract path instead of hanging the Flask worker.
-    """
-
-    raise RuntimeError(
-        "Local Qari OCR inference is disabled in this constrained demo. "
-        f"Use QARI_OCR_PROVIDER=space, or deploy {QARI_LOCAL_MODEL_NAME} / {QARI_LATEST_MODEL_NAME} on a GPU host."
-    )
-
-
-def _qari_page_text(image: Image.Image) -> str:
-    if QARI_OCR_PROVIDER in {"space", "hf_space", "gradio"}:
-        return _qari_space_text(image)
-    if QARI_OCR_PROVIDER in {"local", "transformers"}:
-        return _qari_local_text(image)
-    if QARI_OCR_PROVIDER == "off":
-        raise RuntimeError("Qari OCR is disabled by QARI_OCR_PROVIDER=off")
-    raise RuntimeError(f"Unsupported Qari OCR provider: {QARI_OCR_PROVIDER}")
-
-
-def _qari_words_from_text(text: str, width: int, height: int) -> List[Dict]:
-    """Create approximate RTL word boxes for Qari's plain-text output.
-
-    This is used only as a safe fallback. The preferred Qari review path below
-    keeps Qari's text, but borrows word-level boxes and confidence values from
-    the legacy Tesseract layout pass so the old Raqim review behavior remains:
-    clicking a word points to the corresponding box on the page, and low
-    confidence words remain yellow.
+    يوزّع الكلمات على أسطر من اليمين إلى اليسار بمواضع تقريبية حتى تبقى صفحة
+    المراجعة قابلة للاستخدام (الضغط على الكلمة يشير إلى موقع تقريبي على الصورة).
     """
 
     text = _clean_text(text)
@@ -256,7 +222,7 @@ def _qari_words_from_text(text: str, width: int, height: int) -> List[Dict]:
             words.append(
                 _word_item(
                     word=token,
-                    confidence=QARI_APPROX_CONFIDENCE,
+                    confidence=0,
                     x=x,
                     y=y,
                     w=token_width,
@@ -266,43 +232,41 @@ def _qari_words_from_text(text: str, width: int, height: int) -> List[Dict]:
                     index=len(words),
                 )
             )
+            # نص الاحتياط غير موثوق الثقة، لذلك يُظلَّل دائمًا للمراجعة اليدوية.
+            words[-1]["highlighted"] = True
+            words[-1]["wasHighlighted"] = True
             x_cursor = x - gap
         y += line_height
 
     return words
 
 
-def _normalize_token_for_alignment(token: str) -> str:
-    """Normalize OCR tokens for loose Qari/Tesseract layout alignment."""
+# _sort_words_for_arabic_reading_order: ترتيب الكلمات بترتيب القراءة العربي
+# (من الأعلى للأسفل، ثم من اليمين لليسار داخل كل سطر).
+def _sort_words_for_arabic_reading_order(words: List[Dict]) -> List[Dict]:
+    """ترتيب كلمات OCR حسب الترتيب البصري للقراءة العربية.
 
-    token = str(token or "").strip().lower()
-    token = re.sub(r"[\u064b-\u065f\u0670\u0640]", "", token)
-    token = token.translate(str.maketrans({
-        "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
-        "ى": "ي", "ة": "ه", "ؤ": "و", "ئ": "ي",
-    }))
-    token = re.sub(r"[^\w\u0600-\u06ff]+", "", token)
-    return token
-
-
-def _sort_layout_words_for_arabic_reading_order(layout_words: List[Dict]) -> List[Dict]:
-    """Sort OCR layout boxes by visual Arabic reading order: top-to-bottom, right-to-left."""
+    يستخدم متوسط ارتفاع الكلمات (median) لتحديد تسامح تجميع الأسطر، ثم يرتّب
+    الأسطر تنازليًا حسب y والكلمات داخل السطر تنازليًا حسب x (يمين ← يسار).
+    """
 
     indexed_words = []
     heights = []
-    for original_index, word in enumerate(layout_words or []):
+    for original_index, word in enumerate(words or []):
         bbox = word.get("bounding_box", {}) or {}
         y = int(bbox.get("y", 0) or 0)
         h = int(bbox.get("h", 1) or 1)
         heights.append(h)
-        indexed_words.append({"word": word, "original_index": original_index, "y": y, "h": h, "x": int(bbox.get("x", 0) or 0)})
+        indexed_words.append(
+            {"word": word, "original_index": original_index, "y": y, "h": h, "x": int(bbox.get("x", 0) or 0)}
+        )
 
     if not indexed_words:
         return []
 
     typical_height = median(heights)
     line_tolerance = max(6, typical_height * 0.65)
-    lines = []
+    lines: List[Dict] = []
 
     for entry in sorted(indexed_words, key=lambda item: (item["y"], item["x"])):
         target_line = None
@@ -316,87 +280,32 @@ def _sort_layout_words_for_arabic_reading_order(layout_words: List[Dict]) -> Lis
             target_line["items"].append(entry)
             target_line["y"] = sum(item["y"] for item in target_line["items"]) / len(target_line["items"])
 
-    sorted_words = []
+    sorted_words: List[Dict] = []
     for line in sorted(lines, key=lambda item: item["y"]):
-        sorted_words.extend(item["word"] for item in sorted(line["items"], key=lambda item: (-item["x"], item["original_index"])))
+        sorted_words.extend(
+            item["word"] for item in sorted(line["items"], key=lambda item: (-item["x"], item["original_index"]))
+        )
+
+    # إعادة ترقيم الفهارس لتبقى متسلسلة بعد إعادة الترتيب.
+    for new_index, word in enumerate(sorted_words):
+        word["index"] = new_index
 
     return sorted_words
 
 
-def _merge_qari_text_with_layout(qari_text: str, layout_words: List[Dict], width: int, height: int) -> List[Dict]:
-    """Use Qari words as the displayed OCR text and legacy boxes/confidence as layout.
+# _ocr_page_tesseract: تشغيل Tesseract على صفحة واحدة واستخراج الكلمات وصناديقها.
+def _ocr_page_tesseract(image: Image.Image) -> List[Dict]:
+    """استخراج الكلمات مع bounding_box والثقة عبر Tesseract فقط.
 
-    Qari's public OCR endpoint returns page text without reliable word-level
-    bounding boxes. Raqim's old review UI depends on those boxes and confidence
-    values. This function therefore performs a lightweight alignment: each Qari
-    token is matched to the nearest remaining legacy layout token when possible,
-    otherwise it consumes the next available layout box. The displayed word stays
-    from Qari; only the box and confidence come from the old layout pass.
+    يستخدم ``image_to_data`` للحصول على إحداثيات وثقة كل كلمة. عند عدم إرجاع
+    أي كلمات ذات صناديق، يلجأ إلى ``image_to_string`` ويبني صناديق تقريبية.
     """
 
-    qari_tokens = [token for token in _clean_text(qari_text).split() if token]
-    if not qari_tokens:
-        return []
-
-    if not layout_words:
-        return _qari_words_from_text(qari_text, width, height)
-
-    layout_words = _sort_layout_words_for_arabic_reading_order(layout_words)
-
-    merged: List[Dict] = []
-    cursor = 0
-    max_lookahead = 18
-
-    for qari_token in qari_tokens:
-        qari_norm = _normalize_token_for_alignment(qari_token)
-        chosen_index = None
-
-        if qari_norm:
-            search_end = min(len(layout_words), cursor + max_lookahead)
-            for i in range(cursor, search_end):
-                layout_norm = _normalize_token_for_alignment(layout_words[i].get("word", ""))
-                if layout_norm and (layout_norm == qari_norm or layout_norm in qari_norm or qari_norm in layout_norm):
-                    chosen_index = i
-                    break
-
-        if chosen_index is None and cursor < len(layout_words):
-            chosen_index = cursor
-
-        if chosen_index is not None and chosen_index < len(layout_words):
-            source = layout_words[chosen_index]
-            confidence = _safe_confidence(source.get("confidence"))
-            bbox = source.get("bounding_box", {}) or {}
-            merged_word = _word_item(
-                word=qari_token,
-                confidence=confidence,
-                x=int(bbox.get("x", 0)),
-                y=int(bbox.get("y", 0)),
-                w=int(bbox.get("w", 1)),
-                h=int(bbox.get("h", 1)),
-                width=int(bbox.get("original_width", width)),
-                height=int(bbox.get("original_height", height)),
-                index=len(merged),
-            )
-            # Preserve the old yellow-highlight behavior from the layout OCR pass.
-            merged_word["highlighted"] = bool(source.get("highlighted", merged_word["highlighted"]))
-            merged_word["wasHighlighted"] = bool(source.get("wasHighlighted", merged_word["highlighted"]))
-            merged.append(merged_word)
-            cursor = chosen_index + 1
-        else:
-            fallback = _qari_words_from_text(qari_token, width, height)[0]
-            fallback["index"] = len(merged)
-            fallback["confidence"] = 0
-            fallback["highlighted"] = True
-            fallback["wasHighlighted"] = True
-            merged.append(fallback)
-
-    return merged
-
-
-def _ocr_page_tesseract(image: Image.Image) -> List[Dict]:
     width, height = image.size
     ocr_image = _normalize_for_ocr(image)
     lang = _preferred_language()
+
+    # إعدادات Tesseract: oem 3 = المحرك الافتراضي، psm 6 = افتراض كتلة نص موحّدة.
     config = os.getenv("OCR_TESSERACT_CONFIG", "--oem 3 --psm 6")
 
     data = pytesseract.image_to_data(ocr_image, lang=lang, config=config, output_type=Output.DICT)
@@ -426,90 +335,47 @@ def _ocr_page_tesseract(image: Image.Image) -> List[Dict]:
             )
         )
 
+    # احتياط: إذا لم تُرجع image_to_data أي كلمات، نستخرج النص الخام ونبني صناديق تقريبية.
     if not words:
         plain_text = _clean_word(pytesseract.image_to_string(ocr_image, lang=lang, config=config))
         if plain_text:
-            words = _qari_words_from_text(plain_text, width, height)
-            for word in words:
-                word["confidence"] = 0
-                word["highlighted"] = True
-                word["wasHighlighted"] = True
+            words = _approximate_words_from_text(plain_text, width, height)
+
+    # ترتيب اختياري حسب القراءة العربية، يُفعَّل عبر OCR_SORT_READING_ORDER=true.
+    if os.getenv("OCR_SORT_READING_ORDER", "false").lower() in {"1", "true", "yes", "on"}:
+        words = _sort_words_for_arabic_reading_order(words)
 
     return words
 
 
-def _ocr_page(image: Image.Image) -> tuple[List[Dict], Dict]:
-    width, height = image.size
-
-    if QARI_OCR_ENABLED:
-        try:
-            qari_text = _qari_page_text(image)
-            layout_words = _ocr_page_tesseract(image)
-            words = _merge_qari_text_with_layout(qari_text, layout_words, width, height)
-            if words:
-                highlighted_count = sum(1 for word in words if word.get("highlighted"))
-                print(
-                    f"✅ Qari OCR extracted {len(words)} review words using provider={QARI_OCR_PROVIDER}; "
-                    f"legacy layout boxes={len(layout_words)}, highlighted={highlighted_count}."
-                )
-                return words, {
-                    "ocr_engine": "qari",
-                    "ocr_engine_label": "Qari OCR",
-                    "ocr_provider": QARI_OCR_PROVIDER,
-                    "qari_attempted": True,
-                    "fallback_used": False,
-                    "fallback_reason": "",
-                }
-            raise RuntimeError("Qari OCR returned empty text")
-        except Exception as qari_error:
-            fallback_reason = str(qari_error)
-            print(f"⚠️ Qari OCR failed; fallback_to_tesseract={QARI_OCR_FALLBACK_TO_TESSERACT}: {fallback_reason}")
-            if not QARI_OCR_FALLBACK_TO_TESSERACT:
-                raise
-
-            return _ocr_page_tesseract(image), {
-                "ocr_engine": "tesseract",
-                "ocr_engine_label": "Tesseract fallback",
-                "ocr_provider": "tesseract",
-                "qari_attempted": True,
-                "fallback_used": True,
-                "fallback_reason": fallback_reason,
-            }
-
-    lang = _preferred_language()
-    return _ocr_page_tesseract(image), {
-        "ocr_engine": "tesseract",
-        "ocr_engine_label": f"Tesseract ({lang})",
-        "ocr_provider": "tesseract",
-        "qari_attempted": False,
-        "fallback_used": False,
-        "fallback_reason": "",
-    }
-
-
+# ocr_with_highlighting: تشغيل OCR على الملف كاملًا وإرجاع نتائج الصفحات للمراجعة.
 def ocr_with_highlighting(file_path: str | os.PathLike[str], output_folder: str | os.PathLike[str]) -> List[Dict]:
-    """Run OCR and return page-level words with review-compatible boxes."""
+    """تشغيل Tesseract على كل صفحات الملف وإرجاع كلمات قابلة للمراجعة.
+
+    لكل صفحة: تُحفظ صورة معاينة (original_page_N.png) لعرضها في الواجهة، ثم
+    تُستخرج الكلمات مع صناديقها وثقتها، مع بيانات المحرك (Tesseract) لكل صفحة.
+    """
 
     output_dir = _prepare_output_folder(output_folder)
     pages = _load_pages(file_path)
+    lang = _preferred_language()
 
     results: List[Dict] = []
     for page_number, image in enumerate(pages, start=1):
         preview_path = output_dir / f"original_page_{page_number}.png"
         image.save(preview_path, format="PNG")
 
-        page_words, engine_info = _ocr_page(image)
+        page_words = _ocr_page_tesseract(image)
         results.append(
             {
                 "page_number": page_number,
                 "image_path": str(preview_path),
                 "text": page_words,
-                "ocr_engine": engine_info.get("ocr_engine", "unknown"),
-                "ocr_engine_label": engine_info.get("ocr_engine_label", "غير معروف"),
-                "ocr_provider": engine_info.get("ocr_provider", "unknown"),
-                "qari_attempted": engine_info.get("qari_attempted", False),
-                "fallback_used": engine_info.get("fallback_used", False),
-                "fallback_reason": engine_info.get("fallback_reason", ""),
+                "ocr_engine": "tesseract",
+                "ocr_engine_label": f"Tesseract ({lang})",
+                "ocr_provider": "tesseract",
+                "fallback_used": False,
+                "fallback_reason": "",
             }
         )
 
