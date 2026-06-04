@@ -13,14 +13,11 @@ ENV PYTHONUNBUFFERED=1 \
 #   - tesseract-ocr-ara        -> Arabic language pack (ara)
 #   - tesseract-ocr-eng        -> English language pack (eng)
 #   - poppler-utils            -> pdftoppm/pdftocairo used by pdf2image to rasterize PDFs
-#   - libgl1 / libglib2.0-0    -> runtime libs needed by Pillow / image processing
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr \
         tesseract-ocr-ara \
         tesseract-ocr-eng \
         poppler-utils \
-        libgl1 \
-        libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # The backend resolves Tesseract via shutil.which("tesseract"); pin the binary
