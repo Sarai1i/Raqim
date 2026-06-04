@@ -1,0 +1,66 @@
+# Raqim - full stack orchestration
+# =================================
+# Services:
+#   backend       -> Flask API + Tesseract OCR + Poppler  (host :5000 -> container :5000)
+#   frontend      -> React production build served on      (host :3000 -> container :3000)
+#   corpusfilter  -> Optional CorpusFilter service on      (host :9090 -> container :9090)
+#
+# Environment variables are read from a `.env` file placed next to this file
+# (or from the shell environment). See the "Docker Setup" section in README.md.
+
+services:
+  backend:
+    build:
+      context: ./Backend
+      dockerfile: Dockerfile
+    image: raqim-backend
+    container_name: raqim-backend
+    ports:
+      - "5000:5000"
+    environment:
+      # --- LLM / ALLaM (via Groq) ---
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-allam-2-7b}
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      # --- OCR ---
+      OCR_TESSERACT_LANG: ${OCR_TESSERACT_LANG:-ara+eng}
+      # --- Service wiring (container network names) ---
+      CORPUS_FILTER_API_URL: ${CORPUS_FILTER_API_URL:-http://corpusfilter:9090/correct}
+      API_PUBLIC_BASE_URL: ${API_PUBLIC_BASE_URL:-http://127.0.0.1:5000}
+    volumes:
+      # Persist uploaded documents and generated/corrected output across restarts.
+      - backend_uploads:/app/uploads
+      - backend_output:/app/corrected_files
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./my-app
+      dockerfile: Dockerfile
+      args:
+        # The browser talks to the backend on the host, so default to localhost:5000.
+        REACT_APP_API_BASE_URL: ${REACT_APP_API_BASE_URL:-http://localhost:5000}
+    image: raqim-frontend
+    container_name: raqim-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # CorpusFilter is an external service. It is only started when you explicitly
+  # enable the "corpusfilter" profile AND provide an image, e.g.:
+  #   CORPUSFILTER_IMAGE=your/corpusfilter:tag docker compose --profile corpusfilter up
+  # The backend reaches it via CORPUS_FILTER_API_URL (http://corpusfilter:9090/correct).
+  corpusfilter:
+    image: ${CORPUSFILTER_IMAGE:-ghcr.io/your-org/corpusfilter:latest}
+    container_name: raqim-corpusfilter
+    profiles:
+      - corpusfilter
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+volumes:
+  backend_uploads:
+  backend_output:

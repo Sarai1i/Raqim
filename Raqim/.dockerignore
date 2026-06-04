@@ -1,0 +1,15 @@
+# Root .dockerignore (shared hygiene for any build context under the project)
+**/.git
+**/.gitignore
+**/.env
+**/.env.*
+**/__pycache__/
+**/*.pyc
+**/node_modules
+**/build
+**/dist
+**/.DS_Store
+**/*.log
+**/*.bak
+**/*.bak_*
+mockups_ui_redesign/

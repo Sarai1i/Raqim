@@ -1,0 +1,19 @@
+# Backend build context excludes
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.bak_*
+ocr_model.py.bak_*
+uploads/
+corrected_files/
+*.log
+.pytest_cache/
+.venv/
+venv/
+test_*.py

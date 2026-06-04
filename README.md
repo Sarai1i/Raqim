@@ -90,5 +90,9 @@ http://localhost:3000
 * CorpusFilter Service
 * Groq API Key (ALLaM 2 7B)
 
-```
+## Docker Setup
+
+```bash
+docker compose build
+docker compose up
 ```
