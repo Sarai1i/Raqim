@@ -1,0 +1,35 @@
+/* توحيد الخط باستخدام Noto Naskh Arabic */
+body {
+  font-family: "Noto Naskh Arabic", serif;
+  background: linear-gradient(135deg, #f0f4f8, #d9e2ec);
+}
+
+.card {
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+  border-radius: 15px;
+}
+
+h2, p, button, label, input {
+  font-family: "Noto Naskh Arabic", serif;
+}
+
+button {
+  transition: background-color 0.3s ease;
+}
+
+button:hover {
+  background-color: #001f3f !important;
+}
+@keyframes spin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}

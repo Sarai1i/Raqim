@@ -1,0 +1,9 @@
+{
+  "short_name": "رقيم",
+  "name": "رقيم - نظام OCR عربي",
+  "icons": [],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#002147",
+  "background_color": "#ffffff"
+}

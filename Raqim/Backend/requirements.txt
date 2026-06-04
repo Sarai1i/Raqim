@@ -1,0 +1,26 @@
+# Flask and Web Framework
+Flask==3.0.0
+Flask-CORS==4.0.0
+ 
+# OCR and Image Processing
+pytesseract==0.3.10
+pdf2image==1.17.0
+Pillow==10.1.0
+ 
+# API Requests
+requests==2.31.0
+ 
+# Environment Variables
+python-dotenv==1.0.0
+ 
+# MongoDB (Optional - for production)
+pymongo==4.6.0
+ 
+# Google Generative AI (Optional - for Gemini suggestions)
+google-generativeai==0.3.0
+ 
+# Groq API (For ALLaM suggestions)
+groq==0.4.2
+ 
+# Additional utilities
+python-dateutil==2.8.2
