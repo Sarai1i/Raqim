@@ -240,6 +240,54 @@ def load_model_and_processor(model_name: str, device: str | None):
     return model, processor, device
 
 
+def _supported_generate_keys(model) -> set[str]:
+    """Return the set of input keys the model's generate/forward can consume.
+
+    Newer ``transformers``/processor versions emit extra tensors (e.g.
+    ``mm_token_type_ids``) that the dots.mocr model does not accept, which makes
+    ``generate()`` raise ``ValueError: The following model_kwargs are not used by
+    the model``. We therefore intersect the processor output with the union of
+    the model's ``forward`` and ``prepare_inputs_for_generation`` parameters.
+    """
+    import inspect
+
+    keys: set[str] = set()
+    for fn_name in ("forward", "prepare_inputs_for_generation"):
+        fn = getattr(model, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            params = inspect.signature(fn).parameters.values()
+        except (TypeError, ValueError):
+            continue
+        for param in params:
+            # Skip **kwargs/*args entries; only keep concrete, named inputs.
+            if param.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
+                continue
+            keys.add(param.name)
+    return keys
+
+
+def _filter_model_inputs(model, inputs):
+    """Drop processor outputs the model can't consume (e.g. mm_token_type_ids)."""
+    supported = _supported_generate_keys(model)
+    if not supported:
+        return inputs
+
+    dropped = [key for key in list(inputs.keys()) if key not in supported]
+    if not dropped:
+        return inputs
+
+    print(
+        "Dropping unsupported processor outputs before generate: "
+        + ", ".join(sorted(dropped)),
+        flush=True,
+    )
+    # ``inputs`` is a BatchFeature (dict-like); rebuild a plain dict with the
+    # supported keys so model.generate() validation passes across versions.
+    return {key: value for key, value in inputs.items() if key in supported}
+
+
 def run_inference(model, processor, device: str, image_path: str, prompt: str, max_new_tokens: int) -> str:
     """Run a single forward pass and return the raw decoded model output."""
     from qwen_vl_utils import process_vision_info
@@ -267,11 +315,15 @@ def run_inference(model, processor, device: str, image_path: str, prompt: str, m
     )
     inputs = inputs.to(device)
 
+    # Keep a reference to input_ids before filtering (used to trim the output).
+    input_ids = inputs["input_ids"]
+    generate_inputs = _filter_model_inputs(model, inputs)
+
     print("Running inference (this can take a while on CPU)...", flush=True)
-    generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+    generated_ids = model.generate(**generate_inputs, max_new_tokens=max_new_tokens)
     generated_ids_trimmed = [
         out_ids[len(in_ids):]
-        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        for in_ids, out_ids in zip(input_ids, generated_ids)
     ]
     output_text = processor.batch_decode(
         generated_ids_trimmed,
