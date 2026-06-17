@@ -396,27 +396,12 @@ def _build_words_with_real_boxes(raw: str, width: int, height: int) -> List[Dict
     return words
 
 
-def _flip_table_cols_to_rtl(cells: List[Dict]) -> List[Dict]:
-    """حوّل أعمدة الجدول من ترتيب HTML (LTR) إلى ترتيب عربي (0 = أقصى اليمين).
-
-    DeepSeek يخرج خلايا ``<td>`` بترتيب DOM من اليسار لليمين. في الواجهة وWord
-    (bidiVisual) العمود 0 يجب أن يكون على اليمين، لذا نعكس الموضع الأفقي مع
-    احترام colspan.
-    """
-    if not cells:
-        return cells
-    ncols = max(c["col"] + c["colspan"] for c in cells)
-    for cell in cells:
-        cell["col"] = max(0, ncols - cell["col"] - cell["colspan"])
-    return cells
-
-
 def _parse_html_table_cells(table_html: str) -> List[Dict]:
     """يحلّل جدول HTML إلى خلايا بمواضعها الصحيحة في الشبكة مع دعم rowspan/colspan.
 
-    يعيد قائمة قواميس: {row, col, rowspan, colspan, text}. يضع كل خلية في أول
-    موضع شاغر في صفّها، ويحجز المواضع التي تغطيها الامتدادات حتى لا تتزحلق الخلايا.
-    ``col`` بعد التحليل يكون RTL (0 = العمود الأيمن).
+    يعيد قائمة قواميس: {row, col, rowspan, colspan, text}. ``col`` يتبع ترتيب HTML
+    من اليسار لليمين (0 = أقصى اليسار في الصفحة) ليتطابق العرض الفيزيائي مع
+    ``direction: ltr`` في الواجهة.
     """
     occupied = set()
     cells: List[Dict] = []
@@ -436,7 +421,7 @@ def _parse_html_table_cells(table_html: str) -> List[Dict]:
                 for dc in range(colspan):
                     occupied.add((r + dr, col + dc))
             col += colspan
-    return _flip_table_cols_to_rtl(cells)
+    return cells
 
 
 def _table_cells_to_words(cells: List[Dict], table_id: int, width: int, height: int, y_start: int = None) -> List[Dict]:
@@ -452,7 +437,8 @@ def _table_cells_to_words(cells: List[Dict], table_id: int, width: int, height: 
 
     words = []
     for c in cells:
-        x = width - margin_x - (c["col"] + c["colspan"]) * col_width
+        # موضع أفقي فيزيائي: col 0 يسار الصفحة، يزداد نحو اليمين.
+        x = margin_x + c["col"] * col_width
         item = _word_item(
             word=c["text"] if c["text"] else " ",
             confidence=DEEPSEEK_APPROX_CONFIDENCE,
@@ -655,10 +641,8 @@ def _words_from_structured_text(text: str, width: int, height: int, y_start: int
             ncols = max(1, len(cells))
             col_width = max(40, (width - 2 * margin_x) // ncols)
             row_h = max(22, int(line_height * 0.8))
-            for ltr_col, cell in enumerate(cells):
-                # Markdown pipe rows arrive LTR; map to RTL column index (0 = right).
-                rtl_col = max(0, ncols - 1 - ltr_col)
-                x = width - margin_x - (rtl_col + 1) * col_width
+            for col, cell in enumerate(cells):
+                x = margin_x + col * col_width
                 item = _word_item(
                     word=cell if cell else " ",
                     confidence=DEEPSEEK_APPROX_CONFIDENCE,
@@ -672,7 +656,7 @@ def _words_from_structured_text(text: str, width: int, height: int, y_start: int
                 )
                 item["table_id"] = table_counter
                 item["table_row"] = table_row_index
-                item["table_col"] = rtl_col
+                item["table_col"] = col
                 item["line_index"] = current_line
                 words.append(item)
             table_row_index += 1

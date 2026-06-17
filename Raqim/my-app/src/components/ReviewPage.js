@@ -128,7 +128,7 @@ const splitWordsIntoBlocks = (words = []) => {
   return blocks;
 };
 
-// حوّل كلمات الجدول إلى مصفوفة صفوف [[خلية, ...], ...]
+// حوّل كلمات الجدول إلى صفوف مرتّبة فيزيائيًا (يسار→يمين) لعرض LTR يطابق الصفحة.
 const buildTableRows = (tableWords = []) => {
   const rowsMap = new Map();
   tableWords.forEach((word) => {
@@ -138,7 +138,13 @@ const buildTableRows = (tableWords = []) => {
   });
   return Array.from(rowsMap.keys())
     .sort((a, b) => a - b)
-    .map((r) => rowsMap.get(r).sort((a, b) => (Number(a.table_col) || 0) - (Number(b.table_col) || 0)));
+    .map((r) => rowsMap.get(r).sort((a, b) => {
+      const colDiff = (Number(a.table_col) || 0) - (Number(b.table_col) || 0);
+      if (colDiff !== 0) return colDiff;
+      const ax = getBoxMetric(getWordBox(a), "x", 0);
+      const bx = getBoxMetric(getWordBox(b), "x", 0);
+      return ax - bx;
+    }));
 };
 
 const ReviewPage = () => {
@@ -531,7 +537,7 @@ const ReviewPage = () => {
               if (block.type === "table") {
                 const rows = buildTableRows(block.words);
                 return (
-                  <table className="review-table" dir="rtl" key={`block-${blockIndex}-table`}>
+                  <table className="review-table" dir="ltr" key={`block-${blockIndex}-table`}>
                     <tbody>
                       {rows.map((cells, rowIndex) => (
                         <tr key={`block-${blockIndex}-row-${rowIndex}`}>

@@ -1825,31 +1825,33 @@ def _build_corrected_docx(path, pages=None):
                 ncols = 0
                 for w in block["words"]:
                     r = int(w.get("table_row", 0))
-                    c = int(w.get("table_col", 0))
+                    ltr_c = int(w.get("table_col", 0))
                     rspan = max(1, int(w.get("table_rowspan", 1)))
                     cspan = max(1, int(w.get("table_colspan", 1)))
-                    cells_info.append((r, c, rspan, cspan, _word_display(w)))
+                    cells_info.append((r, ltr_c, rspan, cspan, _word_display(w)))
                     nrows = max(nrows, r + rspan)
-                    ncols = max(ncols, c + cspan)
+                    ncols = max(ncols, ltr_c + cspan)
                 if not cells_info or nrows < 1 or ncols < 1:
                     continue
 
                 table = document.add_table(rows=nrows, cols=ncols)
                 table.style = "Table Grid"
                 table.alignment = WD_TABLE_ALIGNMENT.RIGHT
-                # اجعل الجدول من اليمين لليسار: العمود 0 يظهر على اليمين (ترتيب عربي).
                 from docx.oxml.ns import qn as _qn
                 from docx.oxml import OxmlElement as _OxmlElement
                 _tblPr = table._tbl.tblPr
                 _bidi = _OxmlElement("w:bidiVisual")
                 _tblPr.append(_bidi)
 
-                for (r, c, rspan, cspan, text) in cells_info:
-                    top_left = table.cell(r, c)
-                    # دمج الخلايا إن كان هناك امتداد
+                for (r, ltr_c, rspan, cspan, text) in cells_info:
+                    # table_col مخزّن LTR (0=يسار الصفحة); bidiVisual يجعل العمود 0 على اليمين.
+                    word_c = max(0, ncols - ltr_c - cspan)
+                    top_left = table.cell(r, word_c)
                     if rspan > 1 or cspan > 1:
-                        bottom_right = table.cell(min(r + rspan - 1, nrows - 1),
-                                                  min(c + cspan - 1, ncols - 1))
+                        bottom_right = table.cell(
+                            min(r + rspan - 1, nrows - 1),
+                            min(word_c + cspan - 1, ncols - 1),
+                        )
                         try:
                             merged = top_left.merge(bottom_right)
                         except Exception:
