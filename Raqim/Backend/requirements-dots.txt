@@ -1,0 +1,35 @@
+# dots.mocr proof-of-concept dependencies (branch-scoped).
+#
+# These requirements are intentionally kept SEPARATE from the main
+# requirements.txt so the existing DeepSeek-OCR-2 pipeline is untouched.
+# Install them into an isolated environment, e.g.:
+#
+#   cd Raqim/Backend
+#   python3 -m venv venv-dots
+#   source venv-dots/bin/activate
+#   # Install a torch build that matches your platform first. For CUDA, e.g.:
+#   #   pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements-dots.txt
+#   python test_dots_ocr.py path/to/page.png
+#
+# A CUDA GPU is strongly recommended; CPU inference works but is very slow.
+
+# Core deep-learning / vision-language stack.
+torch>=2.5.0
+torchvision>=0.20.0
+
+# dots.mocr ships its model code via trust_remote_code on top of transformers.
+# The upstream repo pins transformers==4.57.6; newer (5.x) releases break the
+# model's remote code, so keep it within the 4.5x line.
+transformers==4.57.6
+accelerate>=0.34.0
+
+# Image/video preprocessing helper used by the dots.mocr / Qwen2-VL processor.
+qwen-vl-utils>=0.0.8
+
+# Image IO.
+Pillow>=10.1.0
+
+# Optional, GPU-only, large build. Enables faster attention if available.
+# The test script automatically falls back to sdpa/eager when this is absent.
+# flash-attn>=2.8.0
