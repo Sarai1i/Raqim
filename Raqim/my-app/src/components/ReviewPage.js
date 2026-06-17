@@ -531,7 +531,7 @@ const ReviewPage = () => {
               if (block.type === "table") {
                 const rows = buildTableRows(block.words);
                 return (
-                  <table className="review-table" key={`block-${blockIndex}-table`}>
+                  <table className="review-table" dir="rtl" key={`block-${blockIndex}-table`}>
                     <tbody>
                       {rows.map((cells, rowIndex) => (
                         <tr key={`block-${blockIndex}-row-${rowIndex}`}>
