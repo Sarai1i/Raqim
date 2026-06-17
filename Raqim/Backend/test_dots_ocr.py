@@ -191,10 +191,93 @@ def _install_flash_attn_stub() -> None:
     )
 
 
+# dots.mocr's remote code is written against (and pinned by upstream to)
+# transformers 4.57.x. transformers >= 5 still loads and runs the model, but the
+# refactored generation/base classes make it emit an immediate end-of-turn token
+# (empty/garbage OCR) for identical inputs. We warn loudly so results are trusted.
+SUPPORTED_TRANSFORMERS = "4.57.6"
+
+
+def _check_transformers_compat() -> None:
+    import transformers
+
+    version = transformers.__version__
+    try:
+        major = int(version.split(".")[0])
+    except (ValueError, IndexError):
+        major = 0
+
+    if major >= 5:
+        print(
+            "\n" + "!" * 70 + "\n"
+            f"WARNING: transformers {version} is installed, but dots.mocr is only\n"
+            f"verified on transformers=={SUPPORTED_TRANSFORMERS}. On transformers 5.x the\n"
+            "model loads and runs but produces EMPTY/INCORRECT OCR output.\n"
+            "Install the supported version for correct results:\n"
+            "    pip install -r requirements-dots.txt\n"
+            "    # or: pip install 'transformers==4.57.6'\n"
+            + "!" * 70 + "\n",
+            flush=True,
+        )
+    elif not version.startswith("4.57"):
+        print(
+            f"Note: transformers {version} detected; dots.mocr is verified on "
+            f"{SUPPORTED_TRANSFORMERS}. If output looks wrong, install "
+            "requirements-dots.txt.",
+            flush=True,
+        )
+
+
+def _patch_cache_position(model) -> None:
+    """Make dots.mocr's ``prepare_inputs_for_generation`` robust to ``cache_position=None``.
+
+    The upstream remote code does ``if cache_position[0] == 0:`` without guarding
+    against ``cache_position`` being ``None``. Some ``transformers`` versions do
+    not pre-compute ``cache_position`` before calling
+    ``prepare_inputs_for_generation``, which raises
+    ``TypeError: 'NoneType' object is not subscriptable`` inside ``generate()``.
+
+    We wrap the bound method and, when ``cache_position`` is missing, derive it
+    from ``input_ids``/``past_key_values`` (0-based on the first step, advancing
+    by the cache length afterwards) so the original logic works unchanged.
+    """
+    import torch
+
+    original = model.prepare_inputs_for_generation
+
+    def _past_length(past) -> int:
+        if past is None:
+            return 0
+        get_seq_length = getattr(past, "get_seq_length", None)
+        if callable(get_seq_length):
+            try:
+                return int(get_seq_length())
+            except Exception:  # noqa: BLE001
+                pass
+        try:  # legacy tuple cache: (layer)(k/v)[batch, heads, seq, dim]
+            return int(past[0][0].shape[-2])
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def safe_prepare(*args, **kwargs):
+        input_ids = args[0] if args else kwargs.get("input_ids")
+        if kwargs.get("cache_position") is None and input_ids is not None:
+            past_len = _past_length(kwargs.get("past_key_values"))
+            seq_len = input_ids.shape[1]
+            kwargs["cache_position"] = torch.arange(
+                past_len, seq_len, device=input_ids.device
+            )
+        return original(*args, **kwargs)
+
+    model.prepare_inputs_for_generation = safe_prepare
+
+
 def load_model_and_processor(model_name: str, device: str | None):
     """Load dots.mocr, transparently supporting CPU (no flash-attn) setups."""
     import torch  # noqa: F401  (imported for availability check)
     from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
+
+    _check_transformers_compat()
 
     device, dtype = _select_dtype_and_device(device)
 
@@ -235,6 +318,8 @@ def load_model_and_processor(model_name: str, device: str | None):
     if not device.startswith("cuda"):
         model = model.to(device)
     model = model.eval()
+
+    _patch_cache_position(model)
 
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     return model, processor, device

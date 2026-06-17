@@ -1,3 +1,3 @@
 # dots.mocr proof-of-concept artifacts (branch-scoped).
 dots_outputs/
-venv-dots/
+venv-dots*/
