@@ -4,6 +4,7 @@ import types
 ocr_stub = types.ModuleType("ocr_model")
 ocr_stub.configure_tesseract = lambda *_args, **_kwargs: None
 ocr_stub.ocr_with_highlighting = lambda *_args, **_kwargs: []
+ocr_stub.DeepSeekOCRError = RuntimeError
 sys.modules["ocr_model"] = ocr_stub
 
 try:

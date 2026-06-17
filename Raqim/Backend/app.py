@@ -7,7 +7,7 @@ import shutil
 import threading
 from io import BytesIO
 from werkzeug.security import generate_password_hash, check_password_hash
-from ocr_model import configure_tesseract, ocr_with_highlighting
+from ocr_model import DeepSeekOCRError, ocr_with_highlighting
 from flask_cors import CORS
 import requests
 import google.generativeai as genai
@@ -213,10 +213,6 @@ def get_gemini_suggestions(word, context="", max_suggestions=5):
 
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key")
 
-# تكوين Tesseract
-TESSERACT_PATH = os.getenv("TESSERACT_CMD") or shutil.which("tesseract") or "tesseract"
-configure_tesseract(TESSERACT_PATH)
-
 # متغيرات المعالجة
 processing_complete = False
 processing_failed = False
@@ -226,10 +222,7 @@ original_file_name = ""
 ocr_engine_status = {
     "engine": "pending",
     "label": "بانتظار المعالجة",
-    "provider": "pending",
-    "qari_attempted": False,
-    "fallback_used": False,
-    "fallback_reason": "",
+    "provider": "deepseek_local",
 }
 
 # مجلدات التخزين
@@ -1151,11 +1144,8 @@ def upload_file():
     ocr_results = []
     ocr_engine_status = {
         "engine": "pending",
-        "label": "جاري تحديد المحرك",
-        "provider": "pending",
-        "qari_attempted": False,
-        "fallback_used": False,
-        "fallback_reason": "",
+        "label": "جاري تحميل DeepSeek-OCR-2",
+        "provider": "deepseek_local",
     }
 
     if "file" not in request.files:
@@ -1190,48 +1180,19 @@ def upload_file():
 
 
 def _summarize_ocr_engine(pages):
-    """تلخيص المحرك المستخدم في آخر معالجة حتى يظهر بوضوح في الواجهة."""
+    """تلخيص محرك DeepSeek-OCR-2 المستخدم في آخر معالجة."""
     if not pages:
         return {
             "engine": "unknown",
             "label": "غير معروف",
-            "provider": "unknown",
-            "qari_attempted": False,
-            "fallback_used": False,
-            "fallback_reason": "",
+            "provider": "deepseek_local",
         }
 
-    fallback_page = next((page for page in pages if page.get("fallback_used")), None)
-    qari_page = next((page for page in pages if page.get("ocr_engine") == "qari"), None)
     first_page = pages[0]
-
-    if fallback_page:
-        return {
-            "engine": "tesseract",
-            "label": "Tesseract fallback",
-            "provider": "tesseract",
-            "qari_attempted": bool(fallback_page.get("qari_attempted")),
-            "fallback_used": True,
-            "fallback_reason": fallback_page.get("fallback_reason", ""),
-        }
-
-    if qari_page:
-        return {
-            "engine": "qari",
-            "label": "Qari OCR",
-            "provider": qari_page.get("ocr_provider", "space"),
-            "qari_attempted": True,
-            "fallback_used": False,
-            "fallback_reason": "",
-        }
-
     return {
-        "engine": first_page.get("ocr_engine", "unknown"),
-        "label": first_page.get("ocr_engine_label", "غير معروف"),
-        "provider": first_page.get("ocr_provider", "unknown"),
-        "qari_attempted": bool(first_page.get("qari_attempted")),
-        "fallback_used": bool(first_page.get("fallback_used")),
-        "fallback_reason": first_page.get("fallback_reason", ""),
+        "engine": first_page.get("ocr_engine", "deepseek"),
+        "label": first_page.get("ocr_engine_label", "DeepSeek-OCR-2"),
+        "provider": first_page.get("ocr_provider", "deepseek_local"),
     }
 
 
@@ -1251,25 +1212,36 @@ def process_ocr(file_entry):
 
     print(f"📂 تحميل الملف من GridFS: {file_entry['filename']}")
 
-    # تشغيل OCR وتحديث `ocr_results`. إذا تعذر Qari لا نعرض Tesseract fallback كنجاح عادي.
+    # تشغيل DeepSeek-OCR-2 وتحديث `ocr_results`.
     try:
         ocr_results = ocr_with_highlighting(temp_file_path, UPLOAD_FOLDER)
         ocr_engine_status = _summarize_ocr_engine(ocr_results)
-        print(f"🔎 OCR engine used: {ocr_engine_status['label']} (provider={ocr_engine_status['provider']}, fallback={ocr_engine_status['fallback_used']})")
+        print(f"🔎 OCR engine used: {ocr_engine_status['label']} (provider={ocr_engine_status['provider']})")
+    except DeepSeekOCRError as ocr_error:
+        processing_complete = False
+        processing_failed = True
+        processing_error = str(ocr_error)
+        ocr_results = []
+        ocr_engine_status = {
+            "engine": "deepseek_error",
+            "label": "تعذر تشغيل DeepSeek-OCR-2",
+            "provider": "deepseek_local",
+            "error": str(ocr_error),
+        }
+        print(f"❌ تعذر تشغيل DeepSeek-OCR-2: {ocr_error}")
+        return
     except Exception as ocr_error:
         processing_complete = False
         processing_failed = True
         processing_error = str(ocr_error)
         ocr_results = []
         ocr_engine_status = {
-            "engine": "tesseract_error",
-            "label": "تعذر تشغيل Tesseract OCR",
-            "provider": "tesseract",
-            "language": "ara+eng",
-            "fallback_used": False,
-            "fallback_reason": str(ocr_error),
+            "engine": "deepseek_error",
+            "label": "تعذر تشغيل DeepSeek-OCR-2",
+            "provider": "deepseek_local",
+            "error": str(ocr_error),
         }
-        print(f"❌ تعذر تشغيل Tesseract OCR على ملف المستخدم باللغتين العربية والإنجليزية: {ocr_error}")
+        print(f"❌ تعذر تشغيل DeepSeek-OCR-2: {ocr_error}")
         return
 
     # ✅ **تأكد من عدم احتواء `ocr_results` على بيانات غير صحيحة**
@@ -1298,10 +1270,10 @@ def review_page():
     if processing_failed:
         return jsonify({
             "status": "failed",
-            "error": "تعذر تشغيل Tesseract OCR على الملف الحالي باللغتين العربية والإنجليزية.",
+            "error": processing_error or "تعذر تشغيل DeepSeek-OCR-2 على الملف الحالي.",
             "details": processing_error,
             "ocr_engine": ocr_engine_status,
-        }), 503
+        }), 200
 
     if not processing_complete:
         return jsonify({"status": "processing"}), 202  # ✅ تحديث الاستجابة في حالة المعالجة
@@ -1612,10 +1584,10 @@ def processing_status():
         if processing_failed:
             return jsonify({
                 "status": "failed",
-                "error": "تعذر تشغيل Tesseract OCR على الملف الحالي باللغتين العربية والإنجليزية.",
+                "error": processing_error or "تعذر تشغيل DeepSeek-OCR-2 على الملف الحالي.",
                 "details": processing_error,
                 "ocr_engine": ocr_engine_status,
-            }), 503
+            }), 200
         return jsonify({"status": "done" if processing_complete else "processing", "ocr_engine": ocr_engine_status})
     except NameError:
         return jsonify({"status": "processing"})  # ✅ تأمين الحالة الافتراضية

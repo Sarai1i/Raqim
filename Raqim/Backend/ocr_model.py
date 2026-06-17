@@ -1,9 +1,7 @@
 """OCR engine for Raqim with DeepSeek-OCR-2 support.
 
-This module keeps the interface expected by ``Backend/app.py``:
+This module exposes DeepSeek-OCR-2 as Raqim's only OCR engine:
 
-- ``configure_tesseract(tesseract_cmd)`` is kept as a no-op shim for backward
-  compatibility (Tesseract has been removed as the OCR engine).
 - ``ocr_with_highlighting(file_path, output_folder)`` converts PDF/image input into
   page images and returns OCR words with bounding boxes and confidence highlighting.
 
@@ -51,15 +49,118 @@ DEEPSEEK_COORD_SCALE = float(os.getenv("DEEPSEEK_COORD_SCALE", "1000.0"))
 _DEEPSEEK_OCR = None
 
 
-def configure_tesseract(tesseract_cmd: str | None = None) -> None:
-    """No-op shim kept for backward compatibility.
+class DeepSeekOCRError(RuntimeError):
+    """Raised when DeepSeek-OCR-2 inference fails."""
 
-    Tesseract has been removed as Raqim's OCR engine in favor of DeepSeek-OCR-2.
-    ``app.py`` still imports and calls this function at startup, so it is kept
-    here intentionally and simply does nothing.
-    """
+
+def configure_tesseract(tesseract_cmd: str | None = None) -> None:
+    """Deprecated no-op. Tesseract was removed; DeepSeek-OCR-2 is the only OCR engine."""
 
     return None
+
+
+def _resolve_deepseek_infer_settings(image: Image.Image) -> Dict[str, int | bool]:
+    """Return safe DeepSeek infer() settings that avoid the model's param_img bug.
+
+    DeepSeek's visual encoder only supports token grids of 144 (768px tiles) and
+    256 (1024px global view). Using base_size=1280 with crop_mode=True triggers:
+    ``cannot access local variable 'param_img' where it is not associated with a value``.
+    """
+    base_size = int(DEEPSEEK_OCR_BASE_SIZE)
+    image_size = int(DEEPSEEK_OCR_IMAGE_SIZE)
+    crop_mode = bool(DEEPSEEK_OCR_CROP_MODE)
+
+    if crop_mode:
+        if base_size != 1024:
+            print(
+                f"⚠️ DeepSeek crop_mode requires base_size=1024; "
+                f"overriding DEEPSEEK_OCR_BASE_SIZE={base_size} → 1024."
+            )
+            base_size = 1024
+        if image_size != 768:
+            print(
+                f"⚠️ DeepSeek crop_mode requires image_size=768; "
+                f"overriding DEEPSEEK_OCR_IMAGE_SIZE={image_size} → 768."
+            )
+            image_size = 768
+    else:
+        if base_size not in {512, 640, 768, 1024, 1280}:
+            print(f"⚠️ Unsupported DEEPSEEK_OCR_BASE_SIZE={base_size}; using 1024.")
+            base_size = 1024
+        if image_size not in {512, 640, 768, 1024}:
+            print(f"⚠️ Unsupported DEEPSEEK_OCR_IMAGE_SIZE={image_size}; using 768.")
+            image_size = 768
+
+    width, height = image.size
+    if crop_mode and max(width, height) > 768:
+        # Large pages need tiling; keep the validated crop profile above.
+        pass
+
+    return {
+        "base_size": base_size,
+        "image_size": image_size,
+        "crop_mode": crop_mode,
+    }
+
+
+def _format_deepseek_error(exc: Exception) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    if "param_img" in message:
+        return (
+            "فشل DeepSeek-OCR-2 بسبب إعدادات صورة غير مدعومة (param_img). "
+            "استخدم DEEPSEEK_OCR_BASE_SIZE=1024 وDEEPSEEK_OCR_IMAGE_SIZE=768 مع crop_mode، "
+            "أو عطّل DEEPSEEK_OCR_CROP_MODE=false."
+        )
+    if "CUDA" in message.upper() or "cuda" in message:
+        return f"تعذر تشغيل DeepSeek-OCR-2 على GPU: {message}"
+    return f"تعذر تشغيل DeepSeek-OCR-2: {message}"
+
+
+def _run_deepseek_infer(model, tokenizer, image_path: str, out_dir: str, image: Image.Image) -> str:
+    """Run model.infer with validated settings and a safe crop_mode retry."""
+    import contextlib
+    import io as _io
+
+    primary = _resolve_deepseek_infer_settings(image)
+    attempts = [primary]
+    if primary["crop_mode"]:
+        attempts.append({**primary, "crop_mode": False})
+
+    last_error: Exception | None = None
+    buffer = _io.StringIO()
+
+    for attempt_index, settings in enumerate(attempts):
+        if attempt_index > 0:
+            print(
+                "⚠️ إعادة محاولة DeepSeek-OCR-2 مع crop_mode=false "
+                f"بعد فشل المحاولة الأولى ({last_error})."
+            )
+        buffer.seek(0)
+        buffer.truncate(0)
+        try:
+            with contextlib.redirect_stdout(buffer):
+                res = model.infer(
+                    tokenizer,
+                    prompt=DEEPSEEK_OCR_PROMPT,
+                    image_file=image_path,
+                    output_path=out_dir,
+                    base_size=settings["base_size"],
+                    image_size=settings["image_size"],
+                    crop_mode=settings["crop_mode"],
+                    save_results=True,
+                )
+            return buffer.getvalue(), res
+        except Exception as exc:
+            last_error = exc
+            message = str(exc)
+            retryable = "param_img" in message or (
+                settings["crop_mode"] and attempt_index == 0
+            )
+            if retryable and attempt_index < len(attempts) - 1:
+                continue
+            raise DeepSeekOCRError(_format_deepseek_error(exc)) from exc
+
+    raise DeepSeekOCRError(_format_deepseek_error(last_error or RuntimeError("unknown DeepSeek failure")))
 
 
 def _load_deepseek_ocr():
@@ -68,6 +169,11 @@ def _load_deepseek_ocr():
     if _DEEPSEEK_OCR is None:
         import torch
         from transformers import AutoModel, AutoTokenizer
+
+        if not torch.cuda.is_available():
+            raise DeepSeekOCRError(
+                "تعذر تشغيل DeepSeek-OCR-2: لا يتوفر GPU NVIDIA في هذه البيئة."
+            )
 
         tokenizer = AutoTokenizer.from_pretrained(
             DEEPSEEK_OCR_MODEL_NAME, trust_remote_code=True
@@ -123,9 +229,6 @@ def _deepseek_ocr_raw(image: Image.Image) -> str:
     stdout to recover the real per-segment boxes, falling back to the infer
     return value or the saved file if no grounding is present (older builds).
     """
-    import contextlib
-    import io as _io
-
     model, tokenizer = _load_deepseek_ocr()
 
     with tempfile.TemporaryDirectory() as work_dir:
@@ -134,19 +237,7 @@ def _deepseek_ocr_raw(image: Image.Image) -> str:
         os.makedirs(out_dir, exist_ok=True)
         image.convert("RGB").save(image_path)
 
-        buffer = _io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            res = model.infer(
-                tokenizer,
-                prompt=DEEPSEEK_OCR_PROMPT,
-                image_file=image_path,
-                output_path=out_dir,
-                base_size=DEEPSEEK_OCR_BASE_SIZE,
-                image_size=DEEPSEEK_OCR_IMAGE_SIZE,
-                crop_mode=DEEPSEEK_OCR_CROP_MODE,
-                save_results=True,
-            )
-        captured = buffer.getvalue()
+        captured, res = _run_deepseek_infer(model, tokenizer, image_path, out_dir, image)
 
         def _trim(t: str) -> str:
             # كل ما بعد علامة "save results" هو سجلّات تشغيل وليس محتوى.
@@ -689,28 +780,37 @@ def _ocr_page(image: Image.Image) -> tuple[List[Dict], Dict]:
 
 
 def ocr_with_highlighting(file_path: str | os.PathLike[str], output_folder: str | os.PathLike[str]) -> List[Dict]:
-    """Run OCR and return page-level words with review-compatible boxes."""
+    """Run DeepSeek-OCR-2 and return page-level words with review-compatible boxes."""
 
     output_dir = _prepare_output_folder(output_folder)
-    pages = _load_pages(file_path)
+    try:
+        pages = _load_pages(file_path)
+    except Exception as exc:
+        raise DeepSeekOCRError(f"تعذر قراءة ملف OCR: {exc}") from exc
 
     results: List[Dict] = []
     for page_number, image in enumerate(pages, start=1):
         preview_path = output_dir / f"original_page_{page_number}.png"
         image.save(preview_path, format="PNG")
 
-        page_words, engine_info = _ocr_page(image)
+        try:
+            page_words, engine_info = _ocr_page(image)
+        except DeepSeekOCRError:
+            raise
+        except Exception as exc:
+            raise DeepSeekOCRError(_format_deepseek_error(exc)) from exc
+
         results.append(
             {
                 "page_number": page_number,
                 "image_path": str(preview_path),
                 "text": page_words,
-                "ocr_engine": engine_info.get("ocr_engine", "unknown"),
-                "ocr_engine_label": engine_info.get("ocr_engine_label", "غير معروف"),
-                "ocr_provider": engine_info.get("ocr_provider", "unknown"),
-                "qari_attempted": engine_info.get("qari_attempted", False),
-                "fallback_used": engine_info.get("fallback_used", False),
-                "fallback_reason": engine_info.get("fallback_reason", ""),
+                "ocr_engine": engine_info.get("ocr_engine", "deepseek"),
+                "ocr_engine_label": engine_info.get("ocr_engine_label", "DeepSeek-OCR-2"),
+                "ocr_provider": engine_info.get("ocr_provider", "deepseek_local"),
+                "qari_attempted": False,
+                "fallback_used": False,
+                "fallback_reason": "",
             }
         )
 
