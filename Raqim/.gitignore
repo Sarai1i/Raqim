@@ -1,6 +1,18 @@
+﻿Backend/.env
+Backend/venv/
+Backend/__pycache__/
+Backend/uploads/
+Backend/corrected_files/
+my-app/node_modules/
+*.pyc
+*.log
 
-Backend/.env
+Backend/deepseek_outputs/
 
-Backend/.env
+Backend/ground_truth/
 
-Backend/.env
+Backend/deepseek_evaluation.xlsx
+
+Raqim/Backend/*.png
+Raqim/Backend/raw_output.txt
+Raqim/Backend/test_eq.py

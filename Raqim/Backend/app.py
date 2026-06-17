@@ -1,15 +1,25 @@
 from flask import Flask, request, jsonify, send_from_directory, send_file, redirect, url_for, session
 import os
 import json
+import re
+import time
 import shutil
 import threading
 from io import BytesIO
+from werkzeug.security import generate_password_hash, check_password_hash
 from ocr_model import configure_tesseract, ocr_with_highlighting
 from flask_cors import CORS
 import requests
 import google.generativeai as genai
 from pymongo import MongoClient
 import gridfs
+
+# تحميل متغيّرات البيئة من ملف .env (المفاتيح والروابط) إن وُجد.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 import io
 
 
@@ -93,6 +103,113 @@ if LLM_PROVIDER == "groq":
     ALLAM_SUGGESTIONS_MODEL_NAME = GROQ_MODEL
     LLM_SUGGESTIONS_ENABLED = False
     OSS_LLM_ENABLED = False
+
+# ============================================================================
+# المدقق العربي: أداة Gradio التي طوّرها فريق المستخدم، تحل محل ALLaM لاقتراحات
+# تصحيح الكلمات. تُستدعى عبر gradio_client وترجع JSON فيه corrections لكل كلمة.
+# الرابط قابل للتبديل عبر متغير البيئة ARABIC_CHECKER_URL (روابط gradio.live مؤقتة).
+# ============================================================================
+ARABIC_CHECKER_ENABLED = os.getenv("ARABIC_CHECKER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+ARABIC_CHECKER_URL = os.getenv("ARABIC_CHECKER_URL", "https://a1ca015aa004c36127.gradio.live/")
+ARABIC_CHECKER_API_NAME = os.getenv("ARABIC_CHECKER_API_NAME", "/predict")
+_ARABIC_CHECKER_CLIENT = None
+
+
+def _get_arabic_checker_client():
+    """تهيئة عميل Gradio مرة واحدة (lazy) للمدقق العربي."""
+    global _ARABIC_CHECKER_CLIENT
+    if _ARABIC_CHECKER_CLIENT is None:
+        from gradio_client import Client
+        _ARABIC_CHECKER_CLIENT = Client(ARABIC_CHECKER_URL)
+    return _ARABIC_CHECKER_CLIENT
+
+
+def get_arabic_checker_suggestions(word, max_suggestions=5):
+    """استدعاء المدقق العربي (أداة Gradio) وإرجاع اقتراحات تصحيح للكلمة.
+
+    شكل الإخراج من الأداة: نص JSON فيه "corrections"، كل عنصر يحوي
+    "incorrect_token" و"suggested_corrections" (قائمة قوائم) و"explanation".
+    نرجع قائمة عناصر بالشكل {word, source, reason} لتتوافق مع واجهة المراجعة.
+    """
+    original_word = (word or "").strip()
+    if not original_word or not ARABIC_CHECKER_ENABLED:
+        return []
+
+    try:
+        client = _get_arabic_checker_client()
+        raw = client.predict(sent=original_word, api_name=ARABIC_CHECKER_API_NAME)
+        data = raw if isinstance(raw, dict) else json.loads(raw)
+    except Exception as e:
+        print(f"❌ خطأ في المدقق العربي (Gradio): {e}")
+        return []
+
+    items = []
+    for correction in (data.get("corrections", []) if isinstance(data, dict) else []):
+        explanations = correction.get("explanation") or []
+        reason = explanations[0] if isinstance(explanations, list) and explanations else "اقتراح من المدقق العربي"
+        for group in correction.get("suggested_corrections", []) or []:
+            candidates = group if isinstance(group, list) else [group]
+            for candidate in candidates:
+                candidate = (str(candidate) if candidate is not None else "").strip()
+                if candidate and candidate != original_word:
+                    items.append({"word": candidate, "source": "arabic_checker", "reason": str(reason)[:120]})
+
+    # إزالة التكرار مع الحفاظ على الترتيب
+    deduped, seen = [], set()
+    for item in items:
+        if item["word"] not in seen:
+            seen.add(item["word"])
+            deduped.append(item)
+    return deduped[:max_suggestions]
+
+
+# ============================================================================
+# Gemini (Google) كمصدر اقتراحات مجاني للتصحيح الإملائي العربي.
+# يعيد استخدام إعداد genai الموجود في أعلى الملف (المفتاح من GEMINI_API_KEY).
+# النموذج قابل للتبديل عبر GEMINI_MODEL_NAME في ملف .env.
+# ============================================================================
+GEMINI_ENABLED = bool(API_KEY)
+
+
+def get_gemini_suggestions(word, context="", max_suggestions=5):
+    """اقتراحات تصحيح إملائي للكلمة العربية عبر Gemini.
+
+    يرسل الكلمة (مع سياقها إن وُجد) ويطلب بدائل مصحّحة فقط. يُرجع عناصر بالشكل
+    {word, source, reason}. يفشل بهدوء (يرجع []) عند غياب المفتاح أو أي خطأ.
+    """
+    word = (word or "").strip()
+    if not word or not GEMINI_ENABLED or model is None:
+        return []
+
+    context_line = f"\nالسياق: {context.strip()}" if context and context.strip() else ""
+    prompt = (
+        "أنت مدقق إملائي للعربية. صحّح الكلمة التالية إن كان بها خطأ إملائي ناتج "
+        "عن التعرّف الضوئي (OCR). أعد فقط البدائل الصحيحة المحتملة، الأكثر ترجيحًا "
+        "أولًا، مفصولة بفواصل، دون أي شرح أو جُمل. إن كانت الكلمة صحيحة فأعد الكلمة "
+        f"نفسها فقط.\nالكلمة: {word}{context_line}"
+    )
+
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.2, max_output_tokens=60
+            ),
+        )
+        text = (response.text or "").strip()
+    except Exception as e:
+        print(f"❌ خطأ في Gemini: {e}")
+        return []
+
+    candidates = re.split(r"[,،\n]+", text)
+    items, seen = [], set()
+    for cand in candidates:
+        cand = cand.strip().strip(".").strip()
+        if cand and cand != word and cand not in seen:
+            seen.add(cand)
+            items.append({"word": cand, "source": "gemini", "reason": "اقتراح من Gemini"})
+    return items[:max_suggestions]
+
 
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key")
 
@@ -213,6 +330,10 @@ class _LocalCollection:
                 matched.append(item)
         return matched
 
+    def find_one(self, query=None, projection=None):
+        results = self.find(query, projection)
+        return results[0] if results else None
+
 
 try:
     # الاتصال بقاعدة البيانات عند توفر MongoDB الحقيقي.
@@ -222,6 +343,7 @@ try:
     fs = gridfs.GridFS(db)  # GridFS لتخزين الملفات الكبيرة
     files_collection = db["files"]
     corrected_words_collection = db["corrected_words"]  # مجموعة الكلمات المصححة
+    users_collection = db["users"]  # مجموعة حسابات المستخدمين
     print("✅ Connected to MongoDB.")
 except Exception as mongo_error:
     print(f"⚠️ MongoDB is not available; using local in-memory storage for demo/testing: {mongo_error}")
@@ -230,6 +352,7 @@ except Exception as mongo_error:
     fs = _LocalGridFS()
     files_collection = _LocalCollection()
     corrected_words_collection = _LocalCollection()
+    users_collection = _LocalCollection()
 
 
 def _apply_correction_to_ocr_results(page_number, word_index, corrected_word):
@@ -363,7 +486,8 @@ def _clean_llm_suggestion(suggestion, original_word):
     cleaned = cleaned.splitlines()[0].strip() if cleaned.splitlines() else cleaned
 
     # منع الردود الطويلة أو الشروحات من الظهور في واجهة الاقتراحات.
-    if not cleaned or len(cleaned.split()) > 4 or len(cleaned) > 80:
+    # نقبل كلمة واحدة (أو كلمتين كحد أقصى) لأن المطلوب تصحيح إملائي لكلمة واحدة فقط.
+    if not cleaned or len(cleaned.split()) > 2 or len(cleaned) > 40:
         return original_word
     return cleaned
 
@@ -499,6 +623,11 @@ def _extract_allam_suggestions_payload(data, original_word, max_suggestions):
         raw = [raw]
     if not isinstance(raw, list):
         raw = []
+    # احتياطي: أحيانًا يكسر النموذج صيغة JSON (مثل "reason:" بدل "reason":)،
+    # فيفشل التحليل العادي. في هذه الحالة نستخرج الكلمات مباشرة بتعبير منتظم.
+    if not raw and content:
+        fallback_words = re.findall(r'"word"\s*:\s*"([^"]+)"', content)
+        raw = [{"word": w} for w in fallback_words]
     return raw[:max_suggestions]
 
 
@@ -515,22 +644,28 @@ def get_allam_correction_suggestions(word, context="", page_number=None, max_sug
     context = (context or "").strip()
     page_number = page_number or "غير متاح"
     system_prompt = (
-        "أنت ALLaM عبر Groq، مساعد عربي متخصص في تصحيح أخطاء OCR. "
-        "أعد JSON صالحًا فقط. لا تستخدم إلا العربية في الاقتراحات. "
-        "إذا كانت الكلمة صحيحة فاجعل is_correct=true واترك suggestions فارغة."
+        "أنت مدقّق إملائي عربي متخصص في تصحيح أخطاء OCR لكلمة واحدة. "
+        "مهمتك تصحيح شكل الكلمة المعطاة فقط (حروف مشوّهة، رموز دخيلة مثل » أو الأرقام، "
+        "حروف ناقصة أو زائدة، همزات وتشكيل خاطئ) دون تغيير معناها. "
+        "كل اقتراح يجب أن يكون كلمة عربية واحدة تشبه الكلمة الأصلية إملائيًا بشكل كبير. "
+        "ممنوع منعًا باتًا اقتراح كلمات مختلفة المعنى أو كلمات من السياق أو عبارات. "
+        "أعد JSON صالحًا فقط بالعربية. إذا كانت الكلمة صحيحة إملائيًا فأرجع is_correct=true و suggestions فارغة."
     )
-    user_prompt = f"""راجع كلمة OCR التالية داخل سياقها واقترح تصحيحات عربية فقط إذا كان الخطأ واضحًا.
+    user_prompt = f"""صحّح الأخطاء الإملائية في الكلمة التالية المستخرجة من OCR، إن وُجدت.
 
-القواعد:
-- أعد JSON صالحًا فقط بالشكل: {{"is_correct": true/false, "suggestions":[{{"word":"...","reason":"..."}}]}}
-- إذا كانت الكلمة صحيحة أو لا يوجد خطأ واضح: {{"is_correct": true, "suggestions":[]}}
-- إذا كانت خاطئة: أعد من 3 إلى {max_suggestions} اقتراحات عربية فقط قدر الإمكان.
-- الاقتراح كلمة واحدة أو عبارة عربية قصيرة جدًا حسب السياق.
+القواعد الصارمة:
+- أعد JSON فقط بالشكل: {{"is_correct": true/false, "suggestions":[{{"word":"...","reason":"..."}}]}}
+- كل اقتراح = كلمة عربية واحدة فقط (ليست عبارة ولا جملة).
+- يجب أن يكون كل اقتراح قريبًا جدًا من شكل الكلمة الأصلية (نفس الحروف تقريبًا، مع إصلاح التشويه فقط).
+- ممنوع اقتراح كلمة معناها مختلف عن الكلمة الأصلية، وممنوع أخذ كلمات من السياق.
+- مثال: لكلمة "القارئ»" الصحيح "القارئ" (إزالة الرمز الدخيل)، وليس "الأول" أو "الكتاب".
+- إذا كانت الكلمة صحيحة إملائيًا: {{"is_correct": true, "suggestions":[]}}
+- إذا كانت خاطئة: أعد من 1 إلى {max_suggestions} اقتراحات إملائية فقط.
+- استخدم السياق للفهم فقط، لا لاقتراح كلمات منه.
 - لا تعد النص كاملًا ولا تضف شرحًا خارج JSON.
 
-الكلمة المحددة: {original_word}
-السياق حول الكلمة: {context}
-رقم الصفحة: {page_number}
+الكلمة المراد تصحيحها: {original_word}
+السياق (للفهم فقط): {context}
 """
 
     try:
@@ -677,16 +812,40 @@ def _extract_ocr_plain_text():
 
 
 def _clean_full_text_llm_response(text):
-    """تنظيف استجابة التصحيح الكامل مع الحفاظ على النص فقط."""
+    """تنظيف استجابة التصحيح الكامل: إزالة المقدمات والتكرار مع الحفاظ على النص."""
     if not text:
         return ""
 
     cleaned = str(text).strip()
-    for marker in ["النص المصحح:", "التصحيح:", "Corrected text:", "Corrected:"]:
+
+    # إزالة المقدمات الشائعة التي يضيفها النموذج أحيانًا
+    intro_markers = [
+        "النص المصحح:", "النص المصحّح:", "التصحيح:", "بعد التصحيح:",
+        "Corrected text:", "Corrected:",
+    ]
+    for marker in intro_markers:
         if marker in cleaned:
             cleaned = cleaned.split(marker, 1)[-1].strip()
 
-    return cleaned.replace("```text", "").replace("```", "").strip()
+    # إزالة سطر افتتاحي يحتوي عبارة مثل "بعد تصحيح الأخطاء ... كالتالي:"
+    lines = cleaned.split("\n")
+    if lines and ("بعد تصحيح" in lines[0] or "يصبح النص" in lines[0]) and lines[0].rstrip().endswith(":"):
+        cleaned = "\n".join(lines[1:]).strip()
+
+    cleaned = cleaned.replace("```text", "").replace("```", "").strip()
+
+    # إزالة الفقرات المكررة المتطابقة (يكرّر النموذج النص أحيانًا)
+    paragraphs = [p.strip() for p in cleaned.split("\n\n")]
+    seen = set()
+    unique_paragraphs = []
+    for paragraph in paragraphs:
+        if len(paragraph) > 40:
+            if paragraph in seen:
+                continue
+            seen.add(paragraph)
+        unique_paragraphs.append(paragraph)
+
+    return "\n\n".join(p for p in unique_paragraphs if p).strip()
 
 
 def correct_full_text_with_open_source_llm(text):
@@ -753,6 +912,187 @@ def correct_full_text_with_open_source_llm(text):
     except Exception as e:
         print(f"❌ خطأ في التصحيح الكامل عبر LLM المفتوح المصدر: {e}")
         return text
+
+
+def correct_full_text_with_groq(text):
+    """تصحيح النص الكامل عبر Groq/ALLaM (نفس مزود اقتراحات المراجعة اليدوية).
+
+    يُرجع None إذا لم يكن Groq متاحًا، حتى يتمكن المستدعي من اللجوء لبديل آخر.
+    """
+    if not text.strip() or LLM_PROVIDER != "groq" or not GROQ_API_KEY:
+        return None
+
+    system_prompt = (
+        "أنت مدقّق لغوي عربي متخصص في تصحيح نصوص OCR. "
+        "مهمتك تصحيح الأخطاء فقط، دون إعادة صياغة أو تلخيص أو اختصار أو إضافة. "
+        "تحافظ على النص كما هو بكامل محتواه وطوله وترتيب فقراته، "
+        "وتصلح فقط أخطاء OCR والإملاء والتشكيل وعلامات الترقيم. "
+        "تعيد النص المصحّح مرة واحدة فقط، دون أي مقدمة أو تكرار."
+    )
+    user_prompt = f"""صحّح أخطاء OCR في النص العربي التالي.
+
+قواعد صارمة يجب الالتزام بها:
+- صحّح أخطاء OCR والإملاء والتشكيل وعلامات الترقيم فقط.
+- لا تُعد صياغة النص، ولا تلخّصه، ولا تختصره — احتفظ بكل الجمل والمحتوى كما هو.
+- استعن بسياق الجملة لاستنتاج الكلمة الصحيحة عند وجود تشويه (مثال: "اللسانبات" ← "اللسانيات").
+- لا تضف أي كلمة أو جملة أو معلومة من عندك.
+- لا تكرّر النص أبدًا — أعِده مرة واحدة فقط.
+- لا تكتب أي مقدمة أو عبارة مثل "النص المصحّح:" أو "بعد التصحيح".
+- حافظ على نفس طول النص وترتيب فقراته الأصلي.
+- أعد النص المصحّح فقط لا غير.
+
+النص المراد تصحيحه:
+{text}
+"""
+    try:
+        print(f"🤖 بدء التصحيح الذكي الكامل عبر Groq ({GROQ_MODEL})...")
+        response = requests.post(
+            f"{GROQ_API_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 4096,
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        corrected = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        corrected = _clean_full_text_llm_response(corrected)
+        print("✅ اكتمل التصحيح الذكي عبر Groq.")
+        return corrected or text
+    except Exception as e:
+        print(f"❌ خطأ في التصحيح الكامل عبر Groq: {e}")
+        return None
+
+
+BATCH_SIZE = 8  # عدد الكلمات منخفضة الثقة في كل طلب (لاحترام حد التوكنز)
+
+
+def _request_corrections_batch(items):
+    """يرسل دفعة كلمات منخفضة الثقة إلى Groq ويرجّع dict {id: corrected_word}."""
+    if not items or LLM_PROVIDER != "groq" or not GROQ_API_KEY:
+        return {}
+
+    system_prompt = (
+        "أنت مدقّق OCR للنصوص المختلطة (عربي وإنجليزي). تصحّح كل كلمة بالاعتماد على سياقها. "
+        "إذا كانت الكلمة عربية لكنها ظهرت بحروف إنجليزية أو أرقام بسبب خطأ OCR، فأعدها عربية صحيحة من السياق. "
+        "وإذا كانت الكلمة إنجليزية (اسم علم، مصطلح، اختصار مثل ARCIF أو ISSN) لكنها ظهرت مشوّهة، فأعدها بالإنجليزية الصحيحة. "
+        "كل تصحيح كلمة واحدة. إن كانت الكلمة صحيحة فأعدها كما هي. لا تضف شرحًا. أعد JSON صالحًا فقط."
+    )
+    user_prompt = (
+        "صحّح كلمات OCR التالية بالاعتماد على سياق كل كلمة، مع مراعاة اللغة الصحيحة:\n"
+        "- الكلمة العربية التي ظهرت حروفًا إنجليزية/أرقامًا ← أعدها عربية صحيحة.\n"
+        "- الكلمة الإنجليزية (اسم/مصطلح/اختصار) التي ظهرت مشوّهة ← أعدها إنجليزية صحيحة.\n"
+        "- لكل عنصر أعد الكلمة المصححة (كلمة واحدة فقط، لا جملة).\n"
+        'أعد JSON فقط بالشكل: {"corrections":[{"id":\u0631\u0642\u0645,"word":"\u0627\u0644\u0643\u0644\u0645\u0629"}]}\n\n'
+        "الكلمات:\n" + json.dumps(items, ensure_ascii=False)
+    )
+
+    for attempt in range(5):
+        try:
+            response = requests.post(
+                f"{GROQ_API_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 1024,
+                },
+                timeout=90,
+            )
+        except Exception as e:
+            print(f"\u274c \u062e\u0637\u0623 \u0634\u0628\u0643\u0629 \u0641\u064a \u062f\u0641\u0639\u0629 \u0627\u0644\u062a\u0635\u062d\u064a\u062d: {e}")
+            return {}
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("retry-after")
+            wait_seconds = float(retry_after) if retry_after else (2 ** attempt) * 3
+            print(f"\u23f3 \u062a\u062c\u0627\u0648\u0632 \u062d\u062f \u0627\u0644\u062a\u0648\u0643\u0646\u0632 (429)\u060c \u0627\u0646\u062a\u0638\u0627\u0631 {wait_seconds:.0f}s...")
+            time.sleep(min(wait_seconds, 30))
+            continue
+
+        if response.status_code != 200:
+            print(f"\u26a0\ufe0f Groq \u0623\u0631\u062c\u0639 {response.status_code}: {response.text[:120]}")
+            return {}
+
+        content_text = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        parsed = _parse_json_safely(content_text)
+        corrections = parsed.get("corrections", []) if isinstance(parsed, dict) else []
+        out = {}
+        for correction in corrections:
+            try:
+                cid = int(correction.get("id"))
+            except (TypeError, ValueError):
+                continue
+            out[cid] = correction.get("word", "")
+        return out
+
+    print("\u26a0\ufe0f \u062a\u0639\u0630\u0631 \u0625\u0643\u0645\u0627\u0644 \u0627\u0644\u062f\u0641\u0639\u0629 \u0628\u0633\u0628\u0628 \u062a\u0643\u0631\u0627\u0631 429.")
+    return {}
+
+
+def build_corrected_text_low_confidence_only():
+    """يبني النص الكامل كما هو مع تصحيح الكلمات منخفضة الثقة فقط عبر ALLaM (بدفعات)."""
+    if not ocr_results:
+        return ""
+
+    # نجمع كل الكلمات منخفضة الثقة عبر كل الصفحات بمعرّف عام
+    page_word_strs = []
+    flat_targets = []  # [(global_id, page_idx, word_idx, word)]
+    global_id = 0
+    for page_idx, page in enumerate(ocr_results):
+        words = page.get("text", [])
+        strs = [(w.get("word", "") or "") for w in words]
+        page_word_strs.append(strs)
+        for word_idx, word in enumerate(words):
+            if word.get("highlighted") and strs[word_idx].strip():
+                flat_targets.append((global_id, page_idx, word_idx, strs[word_idx]))
+                global_id += 1
+
+    total_low = len(flat_targets)
+
+    if LLM_PROVIDER == "groq" and GROQ_API_KEY and flat_targets:
+        corrections_map = {}
+        batch_count = (len(flat_targets) + BATCH_SIZE - 1) // BATCH_SIZE
+        for batch_no, batch_start in enumerate(range(0, len(flat_targets), BATCH_SIZE), start=1):
+            batch = flat_targets[batch_start:batch_start + BATCH_SIZE]
+            items = []
+            for (gid, p_idx, w_idx, word) in batch:
+                strs = page_word_strs[p_idx]
+                start = max(0, w_idx - 4)
+                end = min(len(strs), w_idx + 5)
+                context = " ".join(strs[start:end])
+                items.append({"id": gid, "word": word, "context": context})
+
+            print(f"\U0001f916 \u062f\u0641\u0639\u0629 {batch_no}/{batch_count} ({len(items)} \u0643\u0644\u0645\u0629)...")
+            corrections_map.update(_request_corrections_batch(items))
+            time.sleep(1.5)  # انتظار بسيط بين الدفعات لاحترام حد التوكنز
+
+        # نطبّق التصحيحات على مواضعها
+        for (gid, p_idx, w_idx, word) in flat_targets:
+            if gid in corrections_map:
+                new_word = _clean_llm_suggestion(corrections_map[gid], word)
+                if new_word:
+                    page_word_strs[p_idx][w_idx] = new_word
+
+    pages_out = [" ".join(s for s in strs if s).strip() for strs in page_word_strs]
+    print(f"\U0001f916 \u062a\u0645 \u062a\u0635\u062d\u064a\u062d {total_low} \u0643\u0644\u0645\u0629 \u0645\u0646\u062e\u0641\u0636\u0629 \u0627\u0644\u062b\u0642\u0629 \u0639\u0628\u0631 ALLaM (\u0627\u0644\u0628\u0627\u0642\u064a \u0643\u0645\u0627 \u0647\u0648).")
+    return "\n\n".join(p for p in pages_out if p)
 
 
 def get_corpus_filter_suggestions(text, threshold=50, top_n=5):
@@ -1051,27 +1391,20 @@ def suggest_correction_api():
 
 @app.route("/get_allam_suggestions", methods=["POST"])
 def get_allam_suggestions_api():
-    """إرجاع اقتراحات ALLaM للكلمة المحددة مع السياق ورقم الصفحة."""
+    """إرجاع اقتراحات المدقق العربي للكلمة المحددة (تم استبدال ALLaM بأداة Gradio)."""
     data = request.json or {}
     word = (data.get("word") or data.get("text") or "").strip()
     if not word:
         return jsonify({"error": "❌ الكلمة المرسلة فارغة!"}), 400
 
     max_suggestions = max(3, min(5, int(data.get("max_suggestions") or 5)))
-    suggestions = get_allam_correction_suggestions(
-        word=word,
-        context=(data.get("context") or "").strip(),
-        page_number=data.get("page_number"),
-        max_suggestions=max_suggestions,
-    )
+    suggestions = get_arabic_checker_suggestions(word, max_suggestions=max_suggestions)
 
     return jsonify({
         "word": word,
         "suggestions": suggestions,
-        "enabled": ALLAM_SUGGESTIONS_ENABLED,
-        "provider": "allam",
-        "model": ALLAM_SUGGESTIONS_MODEL_NAME,
-        "endpoint_configured": bool(ALLAM_SUGGESTIONS_ENDPOINT or ALLAM_SUGGESTIONS_API_BASE_URL),
+        "enabled": ARABIC_CHECKER_ENABLED,
+        "provider": "arabic_checker",
         "auto_applied": False,
     })
 
@@ -1088,16 +1421,22 @@ def get_all_suggestions_api():
 
     suggestions = []
 
-    # المطلوب: ALLaM عبر Groq فقط كمصدر LLM، مع إبقاء CorpusFilter بجانبه.
-    for item in get_allam_correction_suggestions(
-        word=word,
-        context=(data.get("context") or "").strip(),
-        page_number=data.get("page_number"),
-        max_suggestions=5,
-    ):
+    # المصدر الأساسي: Gemini (مجاني، جودة عربية عالية).
+    context = (data.get("context") or "").strip()
+    gemini_count = 0
+    for item in get_gemini_suggestions(word, context=context, max_suggestions=5):
         if item.get("word") and item.get("word") != word:
             suggestions.append(item)
+            gemini_count += 1
 
+    # مصدر احتياطي: المدقق العربي (أداة Gradio) إن كان رابطها شغّالًا.
+    checker_count = 0
+    for item in get_arabic_checker_suggestions(word, max_suggestions=5):
+        if item.get("word") and item.get("word") != word:
+            suggestions.append(item)
+            checker_count += 1
+
+    corpus_count = 0
     for item in get_corpus_filter_suggestions(word, threshold=50, top_n=5):
         candidate = item.get("word")
         if candidate and candidate != word:
@@ -1107,6 +1446,9 @@ def get_all_suggestions_api():
                 "score": item.get("score"),
                 "freq": item.get("freq")
             })
+            corpus_count += 1
+
+    print(f"🤖 اقتراحات الكلمة [{word}] → Gemini: {gemini_count} | المدقق العربي: {checker_count} | Corpus: {corpus_count}")
 
     deduped = []
     seen = set()
@@ -1118,12 +1460,10 @@ def get_all_suggestions_api():
 
     return jsonify({
         "suggestions": deduped,
-        "llm_provider": LLM_PROVIDER or "allam",
-        "other_llm_sources_enabled": False,
+        "llm_provider": "gemini" if GEMINI_ENABLED else "arabic_checker",
+        "gemini_enabled": GEMINI_ENABLED,
         "corpusfilter_enabled": True,
-        "allam_enabled": ALLAM_SUGGESTIONS_ENABLED,
-        "allam_endpoint_configured": bool(ALLAM_SUGGESTIONS_ENDPOINT or ALLAM_SUGGESTIONS_API_BASE_URL),
-        "allam_model": ALLAM_SUGGESTIONS_MODEL_NAME,
+        "arabic_checker_enabled": ARABIC_CHECKER_ENABLED,
         "auto_applied": False
     })
 
@@ -1184,7 +1524,10 @@ def auto_correct_text():
     if not original_text:
         return jsonify({"error": "❌ لا توجد نتائج OCR متاحة للتصحيح التلقائي!"}), 404
 
-    corrected_text = correct_full_text_with_open_source_llm(original_text)
+    # نصحّح الكلمات منخفضة الثقة فقط ونُبقي بقية النص كما هو حرفيًا.
+    corrected_text = build_corrected_text_low_confidence_only()
+    if not corrected_text:
+        corrected_text = original_text
 
     auto_corrected_file = os.path.join(OUTPUT_FOLDER, "auto_corrected_text.txt")
     with open(auto_corrected_file, "w", encoding="utf-8") as f:
@@ -1195,6 +1538,69 @@ def auto_correct_text():
         as_attachment=True,
         download_name="raqeim_auto_corrected_text.txt",
         mimetype="text/plain; charset=utf-8"
+    )
+
+
+def _smart_corrected_pages():
+    """نسخة من نتائج OCR مع تطبيق تصحيح الكلمات منخفضة الثقة على corrected_word.
+
+    تُستخدم لبناء ملف Word ذكي مع الحفاظ على البنية (فقرات/عناوين/جداول)، دون
+    تعديل الحالة العامة ocr_results.
+    """
+    import copy
+    pages = copy.deepcopy(ocr_results)
+
+    # نجمع الكلمات منخفضة الثقة عبر كل الصفحات بمعرّف عام
+    flat_targets = []  # [(global_id, page_idx, word_idx, word, context)]
+    global_id = 0
+    for p_idx, page in enumerate(pages):
+        words = page.get("text", [])
+        strs = [(w.get("word", "") or "") for w in words]
+        for w_idx, word in enumerate(words):
+            if word.get("highlighted") and strs[w_idx].strip():
+                start = max(0, w_idx - 4)
+                end = min(len(strs), w_idx + 5)
+                flat_targets.append((global_id, p_idx, w_idx, strs[w_idx], " ".join(strs[start:end])))
+                global_id += 1
+
+    if LLM_PROVIDER == "groq" and GROQ_API_KEY and flat_targets:
+        corrections_map = {}
+        for batch_start in range(0, len(flat_targets), BATCH_SIZE):
+            batch = flat_targets[batch_start:batch_start + BATCH_SIZE]
+            items = [{"id": gid, "word": word, "context": ctx} for (gid, _p, _w, word, ctx) in batch]
+            corrections_map.update(_request_corrections_batch(items))
+            time.sleep(1.5)
+
+        for (gid, p_idx, w_idx, word, _ctx) in flat_targets:
+            if gid in corrections_map:
+                new_word = _clean_llm_suggestion(corrections_map[gid], word)
+                if new_word and new_word != word:
+                    wd = pages[p_idx]["text"][w_idx]
+                    wd["corrected_word"] = new_word
+                    wd["word"] = new_word
+
+    return pages
+
+
+@app.route("/auto_correct_docx", methods=["POST", "GET"])
+def auto_correct_docx():
+    """التصحيح الذكي بصيغة Word (.docx) مع الحفاظ على الفقرات والعناوين والجداول."""
+    if not ocr_results:
+        return jsonify({"error": "❌ لا توجد نتائج OCR متاحة للتصحيح التلقائي!"}), 404
+
+    try:
+        pages = _smart_corrected_pages()
+        docx_path = os.path.join(OUTPUT_FOLDER, "auto_corrected_text.docx")
+        _build_corrected_docx(docx_path, pages=pages)
+    except Exception as e:
+        print(f"❌ خطأ في إنشاء ملف Word الذكي: {e}")
+        return jsonify({"error": f"❌ تعذر إنشاء ملف Word: {e}"}), 500
+
+    return send_file(
+        docx_path,
+        as_attachment=True,
+        download_name="raqeim_auto_corrected_text.docx",
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
 
@@ -1332,6 +1738,260 @@ def download_corrected():
     # إرسال الملف للتنزيل
     return send_file(corrected_text_file, as_attachment=True, download_name="corrected_text.txt", mimetype="text/plain")
 
+
+def _word_display(word_data):
+    """النص المعروض للكلمة مع تفضيل التصحيح اليدوي."""
+    return (word_data.get("corrected_word") or word_data.get("word") or "").strip()
+
+
+def _set_rtl_paragraph(paragraph):
+    """ضبط اتجاه الفقرة من اليمين لليسار (للعربية)."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    pPr = paragraph._p.get_or_add_pPr()
+    bidi = OxmlElement("w:bidi")
+    pPr.append(bidi)
+
+
+def _fix_omml_bugs(omml):
+    """يصلّح أخطاء معروفة في ناتج mathml2omml.
+
+    أبرزها: عند تحويل ``\\vec`` (سهم فوق الحرف) تُغلق المكتبة الوسم خطأً بـ
+    ``</m:groupChr>`` بدل ``</m:groupChrPr>``، فينكسر XML. نصلّح الإغلاق حتى
+    يبقى السهم الحقيقي فوق المتجه بدل اللجوء إلى بديل.
+    """
+    omml = omml.replace('<m:pos m:val="top"/></m:groupChr>', '<m:pos m:val="top"/></m:groupChrPr>')
+    return omml
+
+
+def _tidy_equation_latex(latex):
+    r"""تنظيف أخطاء OCR الشائعة داخل معادلات LaTeX قبل تحويلها.
+
+    مثال: يقرأ DeepSeek الصفر المنخفض في ``\mu_0`` أحيانًا كفاصلة (``\mu_,``)
+    أو ``\mu_{,}``، فنعيدها إلى صفر. كما نزيل فراغات زائدة.
+    """
+    if not latex:
+        return latex
+    latex = re.sub(r"_\{?\s*[,،]\s*\}?", "_{0}", latex)  # منخفض = فاصلة -> صفر
+    latex = re.sub(r"\\bullet\s*", "", latex)  # إزالة نقطة تعداد تسرّبت للمعادلة
+    return latex.strip()
+
+
+def _latex_to_omml_element(latex):
+    """حوّل LaTeX إلى عنصر معادلة Word حقيقية (OMML). يرجع None عند الفشل."""
+    try:
+        import latex2mathml.converter as _l2m
+        import mathml2omml
+        from docx.oxml import parse_xml
+        mathml = _l2m.convert(_tidy_equation_latex(latex))
+        omml = _fix_omml_bugs(mathml2omml.convert(mathml))
+        omml = omml.replace(
+            "<m:oMath>",
+            '<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">',
+            1,
+        )
+        return parse_xml(omml)
+    except Exception as e:
+        print(f"⚠️ تعذّر تحويل معادلة إلى Word، سيُكتب نصها كما هو: {str(e)[:80]}")
+        return None
+
+
+def _add_math_paragraph(document, latex, align_right, _set_rtl_paragraph):
+    """يضيف فقرة تحوي معادلة Word حقيقية، أو نص LaTeX احتياطيًا عند فشل التحويل."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    p = document.add_paragraph()
+    element = _latex_to_omml_element(latex)
+    if element is not None:
+        p._p.append(element)
+    else:
+        run = p.add_run(f"$ {latex} $")  # احتياطي: نص LaTeX واضح
+        run.font.name = "Cambria Math"
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER  # المعادلات تُوسّط عادةً
+    return p
+
+
+def _build_corrected_docx(path, pages=None):
+    """بناء ملف Word (.docx) من نتائج OCR: فقرات وعناوين وجداول حقيقية مع RTL.
+
+    يعتمد على وسوم block_id/block_type/table_* التي يضيفها محرك OCR، فيعيد بناء
+    البنية: العناوين كعناوين، الفقرات كفقرات، والجداول كجداول Word بخلايا حقيقية.
+    يمكن تمرير ``pages`` لاستخدام نسخة مصححة بدل الحالة العامة.
+    """
+    from docx import Document
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+
+    source_pages = pages if pages is not None else ocr_results
+
+    document = Document()
+    # خط افتراضي يدعم العربية
+    style = document.styles["Normal"]
+    style.font.name = "Arial"
+    style.font.size = Pt(12)
+
+    for page in source_pages:
+        words = page.get("text", [])
+        if not words:
+            continue
+
+        # تجميع الكلمات إلى كتل بالترتيب حسب block_id
+        blocks = []
+        for word in words:
+            bid = word.get("block_id")
+            btype = word.get("block_type", "text")
+            if blocks and blocks[-1]["id"] == bid and blocks[-1]["type"] == btype:
+                blocks[-1]["words"].append(word)
+            else:
+                blocks.append({"id": bid, "type": btype, "words": [word]})
+
+        for block in blocks:
+            if block["type"] == "table":
+                # إعادة بناء الجدول مع دعم الخلايا المدموجة (rowspan/colspan).
+                cells_info = []
+                nrows = 0
+                ncols = 0
+                for w in block["words"]:
+                    r = int(w.get("table_row", 0))
+                    c = int(w.get("table_col", 0))
+                    rspan = max(1, int(w.get("table_rowspan", 1)))
+                    cspan = max(1, int(w.get("table_colspan", 1)))
+                    cells_info.append((r, c, rspan, cspan, _word_display(w)))
+                    nrows = max(nrows, r + rspan)
+                    ncols = max(ncols, c + cspan)
+                if not cells_info or nrows < 1 or ncols < 1:
+                    continue
+
+                table = document.add_table(rows=nrows, cols=ncols)
+                table.style = "Table Grid"
+                table.alignment = WD_TABLE_ALIGNMENT.RIGHT
+                # اجعل الجدول من اليمين لليسار: العمود 0 يظهر على اليمين (ترتيب عربي).
+                from docx.oxml.ns import qn as _qn
+                from docx.oxml import OxmlElement as _OxmlElement
+                _tblPr = table._tbl.tblPr
+                _bidi = _OxmlElement("w:bidiVisual")
+                _tblPr.append(_bidi)
+
+                for (r, c, rspan, cspan, text) in cells_info:
+                    top_left = table.cell(r, c)
+                    # دمج الخلايا إن كان هناك امتداد
+                    if rspan > 1 or cspan > 1:
+                        bottom_right = table.cell(min(r + rspan - 1, nrows - 1),
+                                                  min(c + cspan - 1, ncols - 1))
+                        try:
+                            merged = top_left.merge(bottom_right)
+                        except Exception:
+                            merged = top_left
+                        target = merged
+                    else:
+                        target = top_left
+                    target.text = text
+                    for p in target.paragraphs:
+                        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                        _set_rtl_paragraph(p)
+                document.add_paragraph("")  # مسافة بعد الجدول
+            elif block["type"] == "heading":
+                heading_text = " ".join(
+                    _word_display(w) for w in block["words"] if _word_display(w)
+                ).strip()
+                if heading_text:
+                    p = document.add_heading(level=2)
+                    run = p.add_run(heading_text)
+                    run.font.name = "Arial"
+                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    _set_rtl_paragraph(p)
+            else:
+                # نبني الكتلة سطرًا بسطر مع دعم المعادلات داخل السطر (inline).
+                # كل سطر يحوي كلماته بالترتيب (نص أو معادلة)، فنضيفها في فقرة واحدة.
+                from docx.oxml.ns import qn
+
+                lines_words = {}
+                for w in block["words"]:
+                    li = w.get("line_index", 0)
+                    lines_words.setdefault(li, []).append(w)
+                line_ids = sorted(lines_words.keys())
+                if not line_ids:
+                    continue
+
+                # هل السطر كله معادلة معروضة وحيدة؟ (لتوسيطها لوحدها)
+                def _line_is_single_display(line_ws):
+                    real = [w for w in line_ws if _word_display(w) or w.get("is_math")]
+                    return len(real) == 1 and real[0].get("is_math") and real[0].get("math_display")
+
+                for li in line_ids:
+                    line_ws = lines_words[li]
+
+                    if _line_is_single_display(line_ws):
+                        mw = next(w for w in line_ws if w.get("is_math"))
+                        _add_math_paragraph(document, mw.get("latex") or mw.get("word"), True, _set_rtl_paragraph)
+                        continue
+
+                    # فقرة عادية: نضيف كل كلمة كنص أو معادلة inline بالترتيب.
+                    p = document.add_paragraph()
+                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    _set_rtl_paragraph(p)
+                    buffer = []
+
+                    def _flush_buffer(par):
+                        if buffer:
+                            text = " ".join(buffer).strip()
+                            # تنظيف المسافة بعد نقطة التعداد: "•M" -> "• M"
+                            text = re.sub(r"^([•\-\*])\s*", r"\1 ", text)
+                            if text:
+                                run = par.add_run(text)
+                                run.font.name = "Arial"
+                            buffer.clear()
+
+                    n_items = len(line_ws)
+                    for pos, w in enumerate(line_ws):
+                        if w.get("is_math"):
+                            _flush_buffer(p)
+                            element = _latex_to_omml_element(w.get("latex") or w.get("word"))
+                            # مسافة قبل المعادلة إن سبقها نص.
+                            if pos > 0:
+                                p.add_run(" ")
+                            if element is not None:
+                                p._p.append(element)
+                            else:
+                                run = p.add_run(f"$ {w.get('latex')} $")
+                                run.font.name = "Cambria Math"
+                            # مسافة بعد المعادلة إن تبعها نص.
+                            if pos < n_items - 1 and not line_ws[pos + 1].get("is_math"):
+                                p.add_run(" ")
+                        else:
+                            disp = _word_display(w)
+                            if disp:
+                                buffer.append(disp)
+                    _flush_buffer(p)
+                continue
+
+        document.add_page_break()
+
+    document.save(path)
+
+
+@app.route("/download_corrected_docx", methods=["GET"])
+def download_corrected_docx():
+    """تنزيل النص المصحح بصيغة Word (.docx) مع فقرات وعناوين وجداول حقيقية."""
+    global ocr_results
+
+    if not ocr_results:
+        return jsonify({"error": "❌ لا توجد نتائج OCR متاحة!"}), 404
+
+    docx_path = os.path.join(OUTPUT_FOLDER, "corrected_text.docx")
+    try:
+        _build_corrected_docx(docx_path)
+    except Exception as e:
+        print(f"❌ خطأ في إنشاء ملف Word: {e}")
+        return jsonify({"error": f"❌ تعذر إنشاء ملف Word: {e}"}), 500
+
+    return send_file(
+        docx_path,
+        as_attachment=True,
+        download_name="raqeim_corrected_text.docx",
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
 #دالة إضافية لأسترجاع الملف من قاعدة البيانات
 @app.route("/get_file/<file_id>/<file_type>", methods=["GET"])
 def get_file(file_id, file_type):
@@ -1412,6 +2072,71 @@ def save_correction():
     except Exception as e:
         print(f"❌ خطأ أثناء حفظ التصحيح: {e}")
         return jsonify({"error": f"❌ خطأ أثناء حفظ التصحيح: {str(e)}"}), 500
+
+
+# ============================================================================
+# مسارات المصادقة: إنشاء حساب وتسجيل الدخول (مع تشفير كلمة المرور)
+# ============================================================================
+
+def _normalise_email(email):
+    return (email or "").strip().lower()
+
+
+@app.route("/register", methods=["POST"])
+def register_api():
+    """إنشاء حساب جديد مع تشفير كلمة المرور وحفظه في قاعدة البيانات."""
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    email = _normalise_email(data.get("email"))
+    password = data.get("password") or ""
+
+    if not name or not email or not password:
+        return jsonify({"error": "❌ الاسم والبريد وكلمة المرور كلها مطلوبة."}), 400
+
+    if len(password) < 6:
+        return jsonify({"error": "❌ كلمة المرور يجب أن تكون 6 أحرف على الأقل."}), 400
+
+    # التحقق من عدم وجود الحساب مسبقًا
+    existing = users_collection.find_one({"email": email})
+    if existing:
+        return jsonify({"error": "❌ هذا البريد مسجّل مسبقًا. سجّل الدخول بدلاً من ذلك."}), 409
+
+    try:
+        users_collection.insert_one({
+            "name": name,
+            "email": email,
+            "password_hash": generate_password_hash(password),
+        })
+        print(f"✅ تم إنشاء حساب جديد: {email}")
+        return jsonify({
+            "message": "✅ تم إنشاء الحساب بنجاح!",
+            "user": {"name": name, "email": email},
+        }), 201
+    except Exception as e:
+        print(f"❌ خطأ أثناء إنشاء الحساب: {e}")
+        return jsonify({"error": f"❌ خطأ أثناء إنشاء الحساب: {str(e)}"}), 500
+
+
+@app.route("/login", methods=["POST"])
+def login_api():
+    """تسجيل الدخول والتحقق من كلمة المرور المشفّرة."""
+    data = request.json or {}
+    email = _normalise_email(data.get("email"))
+    password = data.get("password") or ""
+
+    if not email or not password:
+        return jsonify({"error": "❌ البريد وكلمة المرور مطلوبان."}), 400
+
+    user = users_collection.find_one({"email": email})
+    if not user or not check_password_hash(user.get("password_hash", ""), password):
+        return jsonify({"error": "❌ البريد أو كلمة المرور غير صحيحة."}), 401
+
+    print(f"✅ تسجيل دخول ناجح: {email}")
+    return jsonify({
+        "message": "✅ تم تسجيل الدخول بنجاح!",
+        "user": {"name": user.get("name", ""), "email": email},
+    }), 200
+
 
 if __name__ == "__main__":
     flask_host = os.getenv("FLASK_HOST", "0.0.0.0")

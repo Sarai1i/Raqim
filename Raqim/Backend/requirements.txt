@@ -1,0 +1,42 @@
+# Flask and Web Framework
+Flask==3.0.0
+Flask-CORS==4.0.0
+ 
+# OCR and Image Processing
+# Tesseract removed — DeepSeek-OCR-2 is now the OCR engine.
+# pytesseract==0.3.10
+pdf2image==1.17.0
+Pillow==10.1.0
+
+# DeepSeek-OCR-2 engine (requires an NVIDIA GPU). Versions tested by DeepSeek:
+transformers==4.46.3
+tokenizers==0.20.3
+einops
+addict
+easydict
+# Install a CUDA build of torch matching your GPU/driver, e.g.:
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+# Optional speed-up (long to build; engine falls back to eager if missing):
+# flash-attn==2.7.3
+ 
+# API Requests
+requests==2.31.0
+ 
+# Environment Variables
+python-dotenv==1.0.0
+ 
+# MongoDB (Optional - for production)
+pymongo==4.6.0
+ 
+# Google Generative AI (Optional - for Gemini suggestions)
+google-generativeai==0.3.0
+ 
+# Groq API (For ALLaM suggestions)
+groq==0.4.2
+ 
+# Additional utilities
+python-dateutil==2.8.2
+python-docx
+latex2mathml
+mathml2omml

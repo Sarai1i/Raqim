@@ -1,8 +1,19 @@
 import React, { useEffect, useRef, useState } from "react";
 import axios from "axios";
+import { InlineMath, BlockMath } from "react-katex";
+import "katex/dist/katex.min.css";
 import API_BASE_URL from "../config";
 
 const getWordBox = (word) => word?.bounding_box || word?.boundingBox || null;
+
+// عرض معادلة LaTeX بأمان: يعرضها منسّقة عبر KaTeX، ويرجع للنص الخام لو فشل التحليل.
+const MathView = ({ latex, display }) => {
+  try {
+    return display ? <BlockMath math={latex} /> : <InlineMath math={latex} />;
+  } catch (e) {
+    return <span className="review-math-fallback">{latex}</span>;
+  }
+};
 
 const getBoxMetric = (box, key, fallback = 0) => {
   const value = Number(box?.[key]);
@@ -86,6 +97,50 @@ const paragraphsToPlainText = (paragraphs) => {
     .join("\n\n");
 };
 
+// قسّم الكلمات إلى كتل بالترتيب: كتلة جدول (كلمات لها نفس table_id) أو كتلة نص.
+const splitWordsIntoBlocks = (words = []) => {
+  const blocks = [];
+  let textRun = [];
+
+  const flushText = () => {
+    if (textRun.length) {
+      blocks.push({ type: "text", words: textRun });
+      textRun = [];
+    }
+  };
+
+  words.forEach((word) => {
+    const tableId = word?.table_id ?? null;
+    if (tableId !== null && tableId !== undefined) {
+      flushText();
+      const last = blocks[blocks.length - 1];
+      if (last && last.type === "table" && last.tableId === tableId) {
+        last.words.push(word);
+      } else {
+        blocks.push({ type: "table", tableId, words: [word] });
+      }
+    } else {
+      textRun.push(word);
+    }
+  });
+
+  flushText();
+  return blocks;
+};
+
+// حوّل كلمات الجدول إلى مصفوفة صفوف [[خلية, ...], ...]
+const buildTableRows = (tableWords = []) => {
+  const rowsMap = new Map();
+  tableWords.forEach((word) => {
+    const r = Number(word.table_row) || 0;
+    if (!rowsMap.has(r)) rowsMap.set(r, []);
+    rowsMap.get(r).push(word);
+  });
+  return Array.from(rowsMap.keys())
+    .sort((a, b) => a - b)
+    .map((r) => rowsMap.get(r).sort((a, b) => (Number(a.table_col) || 0) - (Number(b.table_col) || 0)));
+};
+
 const ReviewPage = () => {
   const [pages, setPages] = useState([]);
   const [currentPage, setCurrentPage] = useState(0);
@@ -140,7 +195,7 @@ const ReviewPage = () => {
   }
 
   const currentWords = pages[currentPage]?.text || [];
-  const currentParagraphs = groupWordsIntoParagraphs(currentWords);
+  const currentBlocks = splitWordsIntoBlocks(currentWords);
   const remainingCount = pages.reduce((acc, page) => acc + (page.text || []).filter((word) => (word.word || "").trim() && !word.corrected).length, 0);
 
   const buildWordContext = (wordIndex) => {
@@ -165,47 +220,9 @@ const ReviewPage = () => {
   };
 
   const updateOriginalHighlight = (wordData, shouldCenter = false) => {
-    const box = getWordBox(wordData);
-    if (!imageRef.current || !originalPreviewRef.current || !box) {
-      setHighlightedBox(null);
-      return;
-    }
-
-    const image = imageRef.current;
-    const preview = originalPreviewRef.current;
-    if (!image.complete || image.naturalWidth === 0 || image.naturalHeight === 0) {
-      setHighlightedBox(null);
-      return;
-    }
-
-    const imageRect = image.getBoundingClientRect();
-    const previewRect = preview.getBoundingClientRect();
-    const sourceWidth = getBoxMetric(box, "original_width", image.naturalWidth || imageRect.width || 1);
-    const sourceHeight = getBoxMetric(box, "original_height", image.naturalHeight || imageRect.height || 1);
-    const scaleX = imageRect.width / sourceWidth;
-    const scaleY = imageRect.height / sourceHeight;
-
-    // الصيغة القديمة الأدق: نحسب موضع الصورة الحقيقي داخل صندوق المعاينة،
-    // ثم نضيف scroll الحالي حتى يبقى المؤشر مثبتاً فوق نفس موضع الكلمة داخل محتوى الصورة.
-    const imageOffsetX = (imageRect.left - previewRect.left) + preview.scrollLeft;
-    const imageOffsetY = (imageRect.top - previewRect.top) + preview.scrollTop;
-    const markerX = imageOffsetX + (getBoxMetric(box, "x", 0) * scaleX);
-    const markerY = imageOffsetY + (getBoxMetric(box, "y", 0) * scaleY);
-    const markerW = Math.max(8, getBoxDimension(box, "w", "width", 1) * scaleX);
-    const markerH = Math.max(10, getBoxDimension(box, "h", "height", 1) * scaleY);
-
-    setHighlightedBox({
-      x: markerX,
-      y: markerY,
-      w: markerW,
-      h: markerH,
-    });
-
-    if (shouldCenter) {
-      const targetTop = Math.max(0, markerY - (preview.clientHeight / 2) + (markerH / 2));
-      const targetLeft = Math.max(0, markerX - (preview.clientWidth / 2) + (markerW / 2));
-      preview.scrollTo({ top: targetTop, left: targetLeft, behavior: "smooth" });
-    }
+    // تم إيقاف التظليل على الملف الأصلي بناءً على طلب المستخدم.
+    // الضغط على الكلمة لا يزال يعمل ويعرض الاقتراحات، لكن لا يظهر أي مربع على الصورة.
+    setHighlightedBox(null);
   };
 
   const fetchSuggestions = async (wordData, event, wordIndex) => {
@@ -379,6 +396,18 @@ const ReviewPage = () => {
     setStatusMessage("تم تنزيل النص حسب التصحيحات الحالية، ويمكنك الاستمرار في المراجعة إذا رغبت.");
   };
 
+  const handleDownloadWord = async () => {
+    // نحفظ التصحيحات أولًا حتى يبني الخادم ملف Word من آخر حالة محدثة.
+    await submitCorrectionsToServer(pages);
+    const link = document.createElement("a");
+    link.href = `${API_BASE_URL}/download_corrected_docx`;
+    link.download = "raqeim_corrected_text.docx";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setStatusMessage("يتم تنزيل ملف Word حسب التصحيحات الحالية.");
+  };
+
   const goToNextWord = () => {
     if (!pages[currentPage]?.text) return;
     let nextIndex = (selectedWordIndex ?? -1) + 1;
@@ -430,6 +459,7 @@ const ReviewPage = () => {
           <p>الكلمات التي تحتاج إلى انتباهك مظللة داخل النص، ويمكنك الضغط على أي كلمة في النص لعرض اقتراحات التصحيح بجانبها.</p>
         </div>
         <button className="rq-button rq-button--primary" onClick={handleDownloadCorrectedText}>تنزيل النص الحالي</button>
+        <button className="rq-button rq-button--secondary" onClick={handleDownloadWord}>تنزيل Word</button>
       </header>
 
       <section className="review-progress-card">
@@ -462,26 +492,28 @@ const ReviewPage = () => {
               if (selectedWordInfo) updateOriginalHighlight(selectedWordInfo);
             }}
           >
-            <img
-              ref={imageRef}
-              src={`${API_BASE_URL}/uploads/original_page_${currentPage + 1}.png`}
-              alt="معاينة الصفحة الأصلية"
-              className="original-image"
-              onLoad={() => {
-                if (selectedWordInfo) updateOriginalHighlight(selectedWordInfo);
-              }}
-            />
-            {highlightedBox && (
-              <div
-                className="original-word-marker"
-                style={{
-                  top: highlightedBox.y,
-                  left: highlightedBox.x,
-                  width: highlightedBox.w,
-                  height: highlightedBox.h,
+            <div className="original-image-wrapper">
+              <img
+                ref={imageRef}
+                src={`${API_BASE_URL}/uploads/original_page_${currentPage + 1}.png`}
+                alt="معاينة الصفحة الأصلية"
+                className="original-image"
+                onLoad={() => {
+                  if (selectedWordInfo) updateOriginalHighlight(selectedWordInfo);
                 }}
               />
-            )}
+              {highlightedBox && (
+                <div
+                  className="original-word-marker"
+                  style={{
+                    top: highlightedBox.top,
+                    left: highlightedBox.left,
+                    width: highlightedBox.width,
+                    height: highlightedBox.height,
+                  }}
+                />
+              )}
+            </div>
           </div>
         </article>
 
@@ -495,35 +527,90 @@ const ReviewPage = () => {
           </div>
 
           <div className="extracted-text" onClick={(event) => event.stopPropagation()}>
-            {currentParagraphs.map((paragraph, paragraphIndex) => (
-              <p className="review-paragraph" key={`paragraph-${paragraphIndex}`}>
-                {paragraph.lines.map((line, lineIndex) => (
-                  <span className="review-line" key={`paragraph-${paragraphIndex}-line-${lineIndex}`}>
-                    {line.words.map(({ word, index }) => {
-                      const isSelected = selectedWordIndex === index && showSuggestions;
-                      const className = [
-                        "review-word",
-                        word.highlighted ? "review-word--flagged" : "",
-                        word.corrected ? "review-word--corrected" : "",
-                        isSelected ? "review-word--selected" : "",
-                      ].filter(Boolean).join(" ");
+            {currentBlocks.map((block, blockIndex) => {
+              if (block.type === "table") {
+                const rows = buildTableRows(block.words);
+                return (
+                  <table className="review-table" key={`block-${blockIndex}-table`}>
+                    <tbody>
+                      {rows.map((cells, rowIndex) => (
+                        <tr key={`block-${blockIndex}-row-${rowIndex}`}>
+                          {cells.map((word) => {
+                            const isSelected = selectedWordIndex === word.index && showSuggestions;
+                            const cellClass = [
+                              "review-table-cell",
+                              word.highlighted ? "review-word--flagged" : "",
+                              word.corrected ? "review-word--corrected" : "",
+                              isSelected ? "review-word--selected" : "",
+                            ].filter(Boolean).join(" ");
+                            return (
+                              <td
+                                key={word.index}
+                                className={cellClass}
+                                rowSpan={Number(word.table_rowspan) > 1 ? Number(word.table_rowspan) : undefined}
+                                colSpan={Number(word.table_colspan) > 1 ? Number(word.table_colspan) : undefined}
+                                onClick={(event) => handleWordClick(word, event, word.index)}
+                                title={word.highlighted ? "خلية تحتاج مراجعة" : "اضغط للمراجعة"}
+                              >
+                                {word.word}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                );
+              }
 
-                      return (
-                        <React.Fragment key={index}>
-                          <span
-                            className={className}
-                            onClick={(event) => handleWordClick(word, event, index)}
-                            title={word.highlighted ? "كلمة تحتاج مراجعة" : "اضغط للمراجعة"}
-                          >
-                            {word.word}
-                          </span>{" "}
-                        </React.Fragment>
-                      );
-                    })}
-                  </span>
-                ))}
-              </p>
-            ))}
+              // كتلة نص عادية
+              const paragraphs = groupWordsIntoParagraphs(block.words);
+              return paragraphs.map((paragraph, paragraphIndex) => (
+                <p className="review-paragraph" key={`block-${blockIndex}-paragraph-${paragraphIndex}`}>
+                  {paragraph.lines.map((line, lineIndex) => (
+                    <span className="review-line" key={`block-${blockIndex}-p-${paragraphIndex}-line-${lineIndex}`}>
+                      {line.words.map(({ word, index }) => {
+                        const isSelected = selectedWordIndex === index && showSuggestions;
+
+                        // كلمة معادلة: نعرضها منسّقة عبر KaTeX (تبقى قابلة للنقر للتصحيح).
+                        if (word.is_math) {
+                          return (
+                            <React.Fragment key={index}>
+                              <span
+                                className={`review-math${isSelected ? " review-word--selected" : ""}`}
+                                onClick={(event) => handleWordClick(word, event, index)}
+                                title="معادلة — اضغط للمراجعة"
+                              >
+                                <MathView latex={word.latex || word.word} display={word.math_display} />
+                              </span>{" "}
+                            </React.Fragment>
+                          );
+                        }
+
+                        const className = [
+                          "review-word",
+                          word.highlighted ? "review-word--flagged" : "",
+                          word.corrected ? "review-word--corrected" : "",
+                          isSelected ? "review-word--selected" : "",
+                        ].filter(Boolean).join(" ");
+
+                        return (
+                          <React.Fragment key={index}>
+                            <span
+                              className={className}
+                              onClick={(event) => handleWordClick(word, event, index)}
+                              title={word.highlighted ? "كلمة تحتاج مراجعة" : "اضغط للمراجعة"}
+                            >
+                              {word.word}
+                            </span>{" "}
+                          </React.Fragment>
+                        );
+                      })}
+                    </span>
+                  ))}
+                </p>
+              ));
+            })}
           </div>
         </article>
       </section>

@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import axios from "axios";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import API_BASE_URL from "../config";
 
 const FileUpload = () => {
@@ -67,10 +67,6 @@ const FileUpload = () => {
           <p>
             ارفع صورة أو ملف PDF، ثم قارن النص المستخرج مع الملف الأصلي، واعتمد التصحيحات التي تراها مناسبة بأسلوب بسيط وواضح.
           </p>
-          <div className="landing-actions">
-            <Link className="rq-button rq-button--secondary" to="/login">تسجيل الدخول</Link>
-            <Link className="rq-button rq-button--ghost" to="/signup">إنشاء حساب</Link>
-          </div>
         </div>
 
         <section className="upload-card" aria-label="رفع ملف للمراجعة">

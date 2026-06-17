@@ -7,12 +7,17 @@ const CorrectionChoicePage = () => {
   const [isAutoCorrecting, setIsAutoCorrecting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
 
-  const handleAutoCorrection = async () => {
+  const handleAutoCorrection = async (format = "txt") => {
     setIsAutoCorrecting(true);
     setErrorMessage("");
 
     try {
-      const response = await fetch(`${API_BASE_URL}/auto_correct_text`, {
+      const endpoint = format === "docx" ? "/auto_correct_docx" : "/auto_correct_text";
+      const fileName = format === "docx"
+        ? "raqeim_auto_corrected_text.docx"
+        : "raqeim_auto_corrected_text.txt";
+
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
         method: "POST",
       });
 
@@ -25,7 +30,7 @@ const CorrectionChoicePage = () => {
       const downloadUrl = window.URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = downloadUrl;
-      link.download = "raqeim_auto_corrected_text.txt";
+      link.download = fileName;
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -76,12 +81,17 @@ const CorrectionChoicePage = () => {
             </p>
             <ul>
               <li>مناسب للمسودات السريعة</li>
-              <li>تنزيل ملف TXT مباشرة</li>
+              <li>تنزيل بصيغة Word أو TXT</li>
               <li>يمكن مراجعته لاحقًا يدويًا</li>
             </ul>
-            <button className="rq-button rq-button--secondary rq-button--full" onClick={handleAutoCorrection} disabled={isAutoCorrecting}>
-              {isAutoCorrecting ? "جارٍ إنشاء الملف..." : "تنزيل نسخة مصححة"}
-            </button>
+            <div className="choice-download-buttons">
+              <button className="rq-button rq-button--secondary rq-button--full" onClick={() => handleAutoCorrection("docx")} disabled={isAutoCorrecting}>
+                {isAutoCorrecting ? "جارٍ إنشاء الملف..." : "تنزيل Word"}
+              </button>
+              <button className="rq-button rq-button--ghost rq-button--full" onClick={() => handleAutoCorrection("txt")} disabled={isAutoCorrecting}>
+                {isAutoCorrecting ? "جارٍ إنشاء الملف..." : "تنزيل TXT"}
+              </button>
+            </div>
           </article>
         </div>
       </section>

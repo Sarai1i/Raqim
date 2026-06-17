@@ -1,101 +1,372 @@
-"""محرك OCR الخاص بمنصة Raqim — يعتمد على Tesseract v5 فقط.
+"""OCR engine for Raqim with DeepSeek-OCR-2 support.
 
-هذا الملف يوفّر الواجهة التي يتوقعها ``Backend/app.py``:
+This module keeps the interface expected by ``Backend/app.py``:
 
-- ``configure_tesseract(tesseract_cmd)`` لضبط مسار تنفيذ Tesseract.
-- ``ocr_with_highlighting(file_path, output_folder)`` لتحويل ملفات PDF/الصور إلى
-  صور صفحات، ثم إرجاع كلمات OCR مع صناديق الإحداثيات (bounding_box) وقيم الثقة
-  (confidence) المطلوبة لتظليل الكلمات منخفضة الثقة في صفحة المراجعة.
+- ``configure_tesseract(tesseract_cmd)`` is kept as a no-op shim for backward
+  compatibility (Tesseract has been removed as the OCR engine).
+- ``ocr_with_highlighting(file_path, output_folder)`` converts PDF/image input into
+  page images and returns OCR words with bounding boxes and confidence highlighting.
 
-المحرك الوحيد المستخدم هنا هو Tesseract v5، ومضبوط افتراضيًا على العربية
-والإنجليزية معًا (``ara+eng``) عند توفّر حزم اللغة. الملف متوافق مع Windows:
-يقرأ مسار Tesseract من متغير البيئة أو يبحث عنه في المسارات الافتراضية، ويدعم
-تمرير مسار Poppler لقراءة ملفات PDF على Windows.
+DeepSeek-OCR-2 is the active OCR engine for Raqim. It is a vision-language model
+that returns the page text (and HTML tables). Since it does not emit word-level
+bounding boxes, an approximate-box builder reconstructs RTL word boxes (and tagged
+table cells) so the Raqim review workflow keeps working.
+
+Note: the model uses custom code (``trust_remote_code=True``), is loaded lazily on
+first use, and requires an NVIDIA GPU. Configure it via the
+``DEEPSEEK_OCR_MODEL_NAME`` environment variable.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import shutil
-import sys
+import tempfile
 from pathlib import Path
-from statistics import median
 from typing import Dict, List
 
 from pdf2image import convert_from_path
-from PIL import Image, ImageOps
-import pytesseract
-from pytesseract import Output
+from PIL import Image
 
 
-# الصيغ المدعومة للصور، وإعدادات OCR القابلة للضبط عبر متغيرات البيئة.
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
-DEFAULT_DPI = int(os.getenv("OCR_PDF_DPI", "220"))
+DEFAULT_DPI = int(os.getenv("OCR_PDF_DPI", "300"))
 DEFAULT_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "80"))
 
-# مسارات Windows الافتراضية لتثبيت Tesseract v5 (تُستخدم عند عدم توفّره في PATH).
-_WINDOWS_TESSERACT_PATHS = [
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-]
+# DeepSeek-OCR-2 is the active OCR engine. It is loaded lazily on first use and
+# needs an NVIDIA GPU. All settings are configurable via environment variables.
+DEEPSEEK_OCR_MODEL_NAME = os.getenv("DEEPSEEK_OCR_MODEL_NAME", "deepseek-ai/DeepSeek-OCR-2")
+# Prompt modes (see the official model card):
+#   document with layout : "<image>\n<|grounding|>Convert the document to markdown. "
+#   plain text only       : "<image>\nFree OCR. "
+DEEPSEEK_OCR_PROMPT = os.getenv("DEEPSEEK_OCR_PROMPT", "<image>\n<|grounding|>Convert the document to markdown. ")
+DEEPSEEK_OCR_BASE_SIZE = int(os.getenv("DEEPSEEK_OCR_BASE_SIZE", "1024"))
+DEEPSEEK_OCR_IMAGE_SIZE = int(os.getenv("DEEPSEEK_OCR_IMAGE_SIZE", "768"))
+DEEPSEEK_OCR_CROP_MODE = os.getenv("DEEPSEEK_OCR_CROP_MODE", "true").lower() in {"1", "true", "yes", "on"}
+# DeepSeek does not emit per-word confidence; approximate boxes use this value.
+DEEPSEEK_APPROX_CONFIDENCE = float(os.getenv("DEEPSEEK_APPROX_CONFIDENCE", "95"))
+# DeepSeek grounding coordinates are normalized to this scale (0..N).
+DEEPSEEK_COORD_SCALE = float(os.getenv("DEEPSEEK_COORD_SCALE", "1000.0"))
+
+_DEEPSEEK_OCR = None
 
 
-# configure_tesseract: ضبط مسار تنفيذ Tesseract المستخدم في كل عمليات OCR.
 def configure_tesseract(tesseract_cmd: str | None = None) -> None:
-    """تحديد ملف tesseract التنفيذي.
+    """No-op shim kept for backward compatibility.
 
-    ترتيب البحث: الوسيط الممرَّر، ثم متغير البيئة ``TESSERACT_CMD``، ثم البحث
-    في ``PATH``، وأخيرًا المسارات الافتراضية على Windows. هذا يضمن عمل المحرك
-    على Windows مع Tesseract v5 دون تعديل الكود.
+    Tesseract has been removed as Raqim's OCR engine in favor of DeepSeek-OCR-2.
+    ``app.py`` still imports and calls this function at startup, so it is kept
+    here intentionally and simply does nothing.
     """
 
-    candidate = tesseract_cmd or os.getenv("TESSERACT_CMD") or shutil.which("tesseract")
-
-    # احتياط خاص بـ Windows عند عدم إضافة Tesseract إلى متغير PATH.
-    if not candidate and sys.platform.startswith("win"):
-        for windows_path in _WINDOWS_TESSERACT_PATHS:
-            if os.path.exists(windows_path):
-                candidate = windows_path
-                break
-
-    if candidate:
-        pytesseract.pytesseract.tesseract_cmd = candidate
+    return None
 
 
-# _available_tesseract_languages: إرجاع مجموعة حزم اللغة المثبتة في Tesseract.
-def _available_tesseract_languages() -> set[str]:
-    try:
-        langs = pytesseract.get_languages(config="")
-        return set(langs or [])
-    except Exception:
-        return set()
+def _load_deepseek_ocr():
+    """Lazily load DeepSeek-OCR-2 (once per process). Requires an NVIDIA GPU."""
+    global _DEEPSEEK_OCR
+    if _DEEPSEEK_OCR is None:
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            DEEPSEEK_OCR_MODEL_NAME, trust_remote_code=True
+        )
+        try:
+            model = AutoModel.from_pretrained(
+                DEEPSEEK_OCR_MODEL_NAME,
+                _attn_implementation="flash_attention_2",
+                trust_remote_code=True,
+                use_safetensors=True,
+            )
+        except Exception as exc:
+            print(f"flash_attention_2 unavailable ({exc}); falling back to eager.")
+            model = AutoModel.from_pretrained(
+                DEEPSEEK_OCR_MODEL_NAME,
+                _attn_implementation="eager",
+                trust_remote_code=True,
+                use_safetensors=True,
+            )
+        model = model.eval().cuda().to(torch.bfloat16)
+        _DEEPSEEK_OCR = (model, tokenizer)
+    return _DEEPSEEK_OCR
 
 
-# _preferred_language: اختيار لغة OCR، مع تفضيل العربية والإنجليزية معًا.
-def _preferred_language() -> str:
-    """إرجاع لغة Tesseract المناسبة.
+def _read_deepseek_result(output_dir: str, fallback) -> str:
+    """Read the markdown/text result DeepSeek writes to output_dir."""
+    import glob
 
-    الافتراضي ``ara+eng`` عند توفّر الحزمتين. يمكن فرض لغة محددة عبر متغير
-    البيئة ``OCR_TESSERACT_LANG`` (مثل ``ara`` أو ``ara+eng``).
+    for pattern in ("*.mmd", "*.md", "*.txt"):
+        files = glob.glob(os.path.join(output_dir, "**", pattern), recursive=True)
+        if files:
+            files.sort(key=os.path.getmtime, reverse=True)
+            try:
+                with open(files[0], "r", encoding="utf-8") as handle:
+                    text = handle.read().strip()
+                if text:
+                    return text
+            except OSError:
+                pass
+    return fallback.strip() if isinstance(fallback, str) else ""
+
+
+def _deepseek_ocr_text(image: Image.Image) -> str:
+    """Extract cleaned page text from an image using DeepSeek-OCR-2."""
+    return _clean_text(_deepseek_ocr_raw(image))
+
+
+def _deepseek_ocr_raw(image: Image.Image) -> str:
+    """Return the RAW DeepSeek output (with <|ref|>/<|det|> grounding tags).
+
+    DeepSeek prints the grounded result to stdout during inference, while the
+    saved .mmd file is already cleaned and carries no coordinates. We capture
+    stdout to recover the real per-segment boxes, falling back to the infer
+    return value or the saved file if no grounding is present (older builds).
     """
+    import contextlib
+    import io as _io
 
-    configured_lang = os.getenv("OCR_TESSERACT_LANG", "").strip()
-    if configured_lang:
-        return configured_lang
+    model, tokenizer = _load_deepseek_ocr()
 
-    langs = _available_tesseract_languages()
-    if {"ara", "eng"}.issubset(langs):
-        return "ara+eng"
-    if "ara" in langs:
-        return "ara"
-    if "eng" in langs:
-        return "eng"
-    return "eng"
+    with tempfile.TemporaryDirectory() as work_dir:
+        image_path = os.path.join(work_dir, "input.png")
+        out_dir = os.path.join(work_dir, "out")
+        os.makedirs(out_dir, exist_ok=True)
+        image.convert("RGB").save(image_path)
+
+        buffer = _io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            res = model.infer(
+                tokenizer,
+                prompt=DEEPSEEK_OCR_PROMPT,
+                image_file=image_path,
+                output_path=out_dir,
+                base_size=DEEPSEEK_OCR_BASE_SIZE,
+                image_size=DEEPSEEK_OCR_IMAGE_SIZE,
+                crop_mode=DEEPSEEK_OCR_CROP_MODE,
+                save_results=True,
+            )
+        captured = buffer.getvalue()
+
+        def _trim(t: str) -> str:
+            # كل ما بعد علامة "save results" هو سجلّات تشغيل وليس محتوى.
+            return re.split(r"=*\s*save results\s*:?\s*=*", t, maxsplit=1)[0]
+
+        # Prefer whichever source actually carries grounding tags.
+        for candidate in (captured, res if isinstance(res, str) else ""):
+            if candidate and ("<|det|>" in candidate or "<|ref|>" in candidate):
+                return _trim(candidate)
+        # No grounding available; fall back to the cleaned saved result.
+        return _trim(_read_deepseek_result(out_dir, res))
 
 
-# _prepare_output_folder: تجهيز مجلد الإخراج وحذف معاينات الصفحات القديمة.
-def _prepare_output_folder(output_folder: str | os.PathLike[str]) -> Path:
+# DeepSeek emits grounding coordinates on a normalized 0..1000 grid.
+
+
+def _scale_box(bbox, width: int, height: int) -> Dict:
+    """Convert a normalized (0..1000) [x1,y1,x2,y2] box to pixel coords for the image."""
+    x1, y1, x2, y2 = bbox
+    px = int(min(x1, x2) / DEEPSEEK_COORD_SCALE * width)
+    py = int(min(y1, y2) / DEEPSEEK_COORD_SCALE * height)
+    pw = max(1, int(abs(x2 - x1) / DEEPSEEK_COORD_SCALE * width))
+    ph = max(1, int(abs(y2 - y1) / DEEPSEEK_COORD_SCALE * height))
+    return {
+        "x": max(0, px),
+        "y": max(0, py),
+        "w": pw,
+        "h": ph,
+        "original_width": int(width),
+        "original_height": int(height),
+    }
+
+
+def _parse_deepseek_segments(raw: str):
+    """Parse RAW DeepSeek output into segments: {bbox: (x1,y1,x2,y2)|None, text}.
+
+    Each segment is: <|ref|>label<|/ref|><|det|>[[..]]<|/det|> followed by its text
+    up to the next <|ref|>. If grounding tags are absent, the whole text is one
+    segment with no bbox.
+    """
+    pattern = re.compile(
+        r"<\|ref\|>(.*?)<\|/ref\|>\s*<\|det\|>(\[\[.*?\]\])<\|/det\|>(.*?)(?=<\|ref\|>|\Z)",
+        re.DOTALL,
+    )
+    segments = []
+    for match in pattern.finditer(raw):
+        label = (match.group(1) or "").strip().lower()
+        nums = [int(n) for n in re.findall(r"-?\d+", match.group(2))]
+        bbox = None
+        if len(nums) >= 4:
+            xs = nums[0::2]
+            ys = nums[1::2]
+            bbox = (min(xs), min(ys), max(xs), max(ys))
+        segments.append({"bbox": bbox, "text": match.group(3), "label": label})
+
+    if not segments:
+        segments.append({"bbox": None, "text": raw, "label": ""})
+    return segments
+
+
+def _assign_intra_segment_source_boxes(seg_words: List[Dict], source_box: Dict, width: int, height: int) -> None:
+    """Estimate a per-word source box inside the segment's real grounding box.
+
+    DeepSeek only gives one real box per segment (paragraph/table). We already
+    laid the segment's words out approximately (RTL lines, correct order) via
+    ``_words_from_structured_text``. Here we linearly map that approximate layout
+    into the real paragraph rectangle, so each word gets a tight sub-box near its
+    true position. This is an estimate (not pixel-perfect) but far tighter than
+    highlighting the whole paragraph.
+    """
+    if not seg_words or not source_box:
+        return
+
+    boxes = [w.get("bounding_box", {}) for w in seg_words]
+    ax0 = min(b.get("x", 0) for b in boxes)
+    ay0 = min(b.get("y", 0) for b in boxes)
+    ax1 = max(b.get("x", 0) + b.get("w", 1) for b in boxes)
+    ay1 = max(b.get("y", 0) + b.get("h", 1) for b in boxes)
+    span_x = max(1, ax1 - ax0)
+    span_y = max(1, ay1 - ay0)
+
+    rx, ry = source_box["x"], source_box["y"]
+    rw, rh = source_box["w"], source_box["h"]
+
+    for word in seg_words:
+        b = word.get("bounding_box", {})
+        nx = (b.get("x", 0) - ax0) / span_x
+        ny = (b.get("y", 0) - ay0) / span_y
+        nw = b.get("w", 1) / span_x
+        nh = b.get("h", 1) / span_y
+        word["source_box"] = {
+            "x": int(rx + nx * rw),
+            "y": int(ry + ny * rh),
+            "w": max(1, int(nw * rw)),
+            "h": max(1, int(nh * rh)),
+            "original_width": int(width),
+            "original_height": int(height),
+        }
+
+
+def _build_words_with_real_boxes(raw: str, width: int, height: int) -> List[Dict]:
+    """Build review words segment-by-segment, attaching each word an estimated
+    ``source_box`` inside the segment's real grounding box (used to highlight the
+    original page), while keeping approximate per-line boxes for the left-panel
+    layout."""
+    segments = _parse_deepseek_segments(raw)
+    words: List[Dict] = []
+
+    for block_id, segment in enumerate(segments):
+        raw_seg = segment["text"]
+
+        # جدول HTML: نحلّله مباشرة مع دعم الامتدادات (rowspan/colspan).
+        table_match = re.search(r"<table[^>]*>.*?</table>", raw_seg, flags=re.DOTALL | re.IGNORECASE)
+        if table_match:
+            source_box = _scale_box(segment["bbox"], width, height) if segment["bbox"] else None
+            y_start = source_box["y"] + 4 if source_box else None
+            cells = _parse_html_table_cells(table_match.group(0))
+            seg_words = _table_cells_to_words(cells, block_id + 1, width, height, y_start=y_start)
+            _assign_intra_segment_source_boxes(seg_words, source_box, width, height)
+            for word in seg_words:
+                word["index"] = len(words)
+                word["block_id"] = block_id
+                word["block_type"] = "table"
+                words.append(word)
+            continue
+
+        seg_text = _clean_text(raw_seg)
+        if not seg_text:
+            continue
+
+        source_box = _scale_box(segment["bbox"], width, height) if segment["bbox"] else None
+        # Lay out this segment's approximate boxes starting at its real top, so the
+        # left-panel paragraph ordering follows the page's real vertical order.
+        y_start = source_box["y"] + 4 if source_box else None
+        seg_words = _words_from_structured_text(seg_text, width, height, y_start=y_start)
+
+        # Estimate a tight per-word source box inside the real paragraph box.
+        _assign_intra_segment_source_boxes(seg_words, source_box, width, height)
+
+        # Classify the block so exports (e.g. Word) can rebuild structure cleanly.
+        label = segment.get("label", "")
+        has_table = any(w.get("table_id") for w in seg_words)
+        if has_table:
+            block_type = "table"
+        elif label in {"title", "sub_title", "section_title", "header"}:
+            block_type = "heading"
+        else:
+            block_type = "text"
+
+        for word in seg_words:
+            word["index"] = len(words)
+            word["block_id"] = block_id
+            word["block_type"] = block_type
+            words.append(word)
+
+    return words
+
+
+def _parse_html_table_cells(table_html: str) -> List[Dict]:
+    """يحلّل جدول HTML إلى خلايا بمواضعها الصحيحة في الشبكة مع دعم rowspan/colspan.
+
+    يعيد قائمة قواميس: {row, col, rowspan, colspan, text}. يضع كل خلية في أول
+    موضع شاغر في صفّها، ويحجز المواضع التي تغطيها الامتدادات حتى لا تتزحلق الخلايا.
+    """
+    occupied = set()
+    cells: List[Dict] = []
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, flags=re.DOTALL | re.IGNORECASE)
+    for r, row_html in enumerate(rows):
+        col = 0
+        for attrs, content in re.findall(r"<t[dh]([^>]*)>(.*?)</t[dh]>", row_html, flags=re.DOTALL | re.IGNORECASE):
+            while (r, col) in occupied:
+                col += 1
+            rs = re.search(r'rowspan="?(\d+)"?', attrs)
+            cs = re.search(r'colspan="?(\d+)"?', attrs)
+            rowspan = int(rs.group(1)) if rs else 1
+            colspan = int(cs.group(1)) if cs else 1
+            text = re.sub(r"<[^>]+>", "", content).strip()
+            cells.append({"row": r, "col": col, "rowspan": rowspan, "colspan": colspan, "text": text})
+            for dr in range(rowspan):
+                for dc in range(colspan):
+                    occupied.add((r + dr, col + dc))
+            col += colspan
+    return cells
+
+
+def _table_cells_to_words(cells: List[Dict], table_id: int, width: int, height: int, y_start: int = None) -> List[Dict]:
+    """يحوّل خلايا الجدول (مع الامتدادات) إلى كلمات مراجعة موسومة."""
+    if not cells:
+        return []
+    nrows = max(c["row"] + c["rowspan"] for c in cells)
+    ncols = max(c["col"] + c["colspan"] for c in cells)
+    margin_x = max(18, width // 35)
+    col_width = max(40, (width - 2 * margin_x) // max(1, ncols))
+    row_h = max(24, min(48, height // max(nrows + 3, 8)))
+    y0 = margin_x if y_start is None else max(margin_x, int(y_start))
+
+    words = []
+    for c in cells:
+        x = width - margin_x - (c["col"] + c["colspan"]) * col_width
+        item = _word_item(
+            word=c["text"] if c["text"] else " ",
+            confidence=DEEPSEEK_APPROX_CONFIDENCE,
+            x=x,
+            y=y0 + c["row"] * row_h,
+            w=col_width * c["colspan"] - 4,
+            h=row_h * c["rowspan"] - 2,
+            width=width,
+            height=height,
+            index=len(words),
+        )
+        item["table_id"] = table_id
+        item["table_row"] = c["row"]
+        item["table_col"] = c["col"]
+        item["table_rowspan"] = c["rowspan"]
+        item["table_colspan"] = c["colspan"]
+        words.append(item)
+    return words
+
+
+def _prepare_output_folder(output_folder):
     folder = Path(output_folder)
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -107,21 +378,12 @@ def _prepare_output_folder(output_folder: str | os.PathLike[str]) -> Path:
     return folder
 
 
-# _load_pages: تحويل ملف PDF/صورة إلى قائمة صور صفحات بصيغة RGB.
 def _load_pages(file_path: str | os.PathLike[str]) -> List[Image.Image]:
-    """قراءة الملف المدخل وإرجاع صفحاته كصور.
-
-    لملفات PDF يُستخدم Poppler عبر ``pdf2image``. على Windows يمكن تمرير مسار
-    Poppler عبر متغير البيئة ``POPPLER_PATH`` إذا لم يكن مضافًا إلى ``PATH``.
-    """
-
     path = Path(file_path)
     suffix = path.suffix.lower()
 
     if suffix == ".pdf":
-        poppler_path = os.getenv("POPPLER_PATH", "").strip() or None
-        pages = convert_from_path(str(path), dpi=DEFAULT_DPI, poppler_path=poppler_path)
-        return [page.convert("RGB") for page in pages]
+        return [page.convert("RGB") for page in convert_from_path(str(path), dpi=DEFAULT_DPI)]
 
     if suffix in SUPPORTED_IMAGE_EXTENSIONS:
         with Image.open(path) as image:
@@ -130,40 +392,85 @@ def _load_pages(file_path: str | os.PathLike[str]) -> List[Image.Image]:
     raise ValueError(f"Unsupported OCR file type: {suffix or 'unknown'}")
 
 
-# _normalize_for_ocr: تحويل الصورة إلى تدرّج رمادي بتباين تلقائي لتحسين دقة OCR.
-def _normalize_for_ocr(image: Image.Image) -> Image.Image:
-    gray = ImageOps.grayscale(image)
-    return ImageOps.autocontrast(gray)
+def _html_table_to_markdown(text: str) -> str:
+    """Convert DeepSeek's <table>...</table> HTML blocks into Markdown pipe rows.
 
-
-# _clean_text: تنظيف النص الكامل بإزالة المسافات الزائدة والأسطر الفارغة.
-def _clean_text(text: str) -> str:
-    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    lines = [re.sub(r"\s+", " ", line).strip() for line in text.split("\n")]
-    return "\n".join(line for line in lines if line).strip()
-
-
-# _clean_word: تنظيف كلمة واحدة بدمج المسافات وإزالة الأطراف.
-def _clean_word(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-# _safe_confidence: تحويل قيمة الثقة إلى رقم عشري آمن (-1 عند الفشل).
-def _safe_confidence(value) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return -1.0
-
-
-# _word_item: بناء عنصر الكلمة الموحّد (نص + ثقة + صندوق إحداثيات + حالة التظليل).
-def _word_item(word: str, confidence: float, x: int, y: int, w: int, h: int, width: int, height: int, index: int) -> Dict:
-    """تكوين قاموس الكلمة المتوافق مع صفحة المراجعة.
-
-    تُظلَّل الكلمة (highlighted) عندما تقل ثقتها عن العتبة الافتراضية، أو عند
-    تعذّر قياس الثقة، حتى ينتبه إليها المستخدم أثناء المراجعة.
+    DeepSeek's markdown mode emits real HTML tables (with rowspan/colspan). We
+    flatten each <tr> into a "| cell | cell |" line so the rest of the pipeline
+    (table detection + frontend rendering) can handle it. Spanning attributes are
+    ignored (cells are kept in order), which is good enough for review display.
     """
 
+    def render_table(match):
+        table_html = match.group(0)
+        rows_out = []
+        for row in re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, flags=re.DOTALL | re.IGNORECASE):
+            cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, flags=re.DOTALL | re.IGNORECASE)
+            cells = [re.sub(r"<[^>]+>", "", c).strip() for c in cells]
+            if cells:
+                rows_out.append("| " + " | ".join(cells) + " |")
+        return "\n" + "\n".join(rows_out) + "\n" if rows_out else ""
+
+    return re.sub(r"<table[^>]*>.*?</table>", render_table, text, flags=re.DOTALL | re.IGNORECASE)
+
+
+def _normalize_latex_math(text: str) -> str:
+    r"""Convert DeepSeek's LaTeX delimiters to standard Markdown math fences.
+
+    DeepSeek emits inline math as ``\( ... \)`` and display math as ``\[ ... \]``,
+    which most Markdown/math renderers do not recognize. We convert them to
+    ``$ ... $`` (inline) and ``$$ ... $$`` (display) so KaTeX/MathJax can render
+    them. The LaTeX body itself is preserved verbatim.
+    """
+    # Display math: \[ ... \]  ->  $$ ... $$
+    text = re.sub(r"\\\[(.+?)\\\]", lambda m: "$$" + m.group(1).strip() + "$$", text, flags=re.DOTALL)
+    # Inline math:  \( ... \)  ->  $ ... $
+    text = re.sub(r"\\\((.+?)\\\)", lambda m: "$" + m.group(1).strip() + "$", text, flags=re.DOTALL)
+    return text
+
+
+def _clean_text(text: str) -> str:
+    """Clean OCR output while preserving paragraph and table (Markdown) structure.
+
+    DeepSeek's layout/markdown mode emits meaningful line breaks (paragraphs,
+    headings), HTML tables, and grounding tags. We convert HTML tables to
+    Markdown rows first, then strip remaining tags, keeping structure intact.
+    """
+
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    # Normalize LaTeX math delimiters \( \) and \[ \] to $ and $$ first.
+    text = _normalize_latex_math(text)
+    # Convert <table> HTML to Markdown pipe rows BEFORE stripping tags.
+    text = _html_table_to_markdown(text)
+    # Remove whole grounding blocks: <|ref|>label<|/ref|> and <|det|>[[..]]<|/det|>.
+    text = re.sub(r"<\|ref\|>.*?<\|/ref\|>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<\|det\|>.*?<\|/det\|>", "", text, flags=re.DOTALL)
+    # Remove any leftover grounding tags and coordinate arrays.
+    text = re.sub(r"<\|[^|>]*\|>", "", text)
+    text = re.sub(r"\[\[[\d,\s]+\]\]", "", text)
+    # Remove any remaining HTML tags (keep their text).
+    text = re.sub(r"<[^>]+>", "", text)
+
+    cleaned_lines = []
+    for line in text.split("\n"):
+        # Collapse repeated spaces/tabs within a line but keep the line itself.
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        # Drop leading Markdown heading markers (e.g. "## عنوان" -> "عنوان").
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        # Drop DeepSeek debug/log lines that may leak from stdout capture.
+        if re.match(r"^=*\s*save results", line) or re.fullmatch(r"=+", line):
+            continue
+        if re.match(r"^(BASE|PATCHES)\s*:", line) or re.match(r"^(image|other)\s*:\s*\d", line):
+            continue
+        cleaned_lines.append(line)
+
+    out = "\n".join(cleaned_lines)
+    # Collapse 3+ blank lines into a single blank line (paragraph separator).
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def _word_item(word: str, confidence: float, x: int, y: int, w: int, h: int, width: int, height: int, index: int) -> Dict:
     highlighted = confidence < DEFAULT_CONFIDENCE_THRESHOLD if confidence >= 0 else True
     return {
         "index": index,
@@ -185,12 +492,29 @@ def _word_item(word: str, confidence: float, x: int, y: int, w: int, h: int, wid
     }
 
 
-# _approximate_words_from_text: توليد صناديق تقريبية لكلمات RTL من نص بلا إحداثيات.
-def _approximate_words_from_text(text: str, width: int, height: int) -> List[Dict]:
-    """احتياط فقط: عند توفّر نص دون صناديق كلمات من Tesseract.
+def _is_table_row(line: str) -> bool:
+    """A Markdown table row looks like: | a | b | c |"""
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.count("|") >= 2
 
-    يوزّع الكلمات على أسطر من اليمين إلى اليسار بمواضع تقريبية حتى تبقى صفحة
-    المراجعة قابلة للاستخدام (الضغط على الكلمة يشير إلى موقع تقريبي على الصورة).
+
+def _is_table_separator(line: str) -> bool:
+    """The row under the header, e.g. |---|---|---| (dashes/colons only)."""
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    return bool(cells) and all(set(c) <= {"-", ":"} and c for c in cells)
+
+
+def _split_table_cells(line: str) -> List[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _words_from_structured_text(text: str, width: int, height: int, y_start: int = None) -> List[Dict]:
+    """Build review words from text while tagging Markdown table cells.
+
+    Normal lines become RTL word boxes. Markdown table rows become one clickable
+    word per cell, tagged with table_id/table_row/table_col so the frontend can
+    render a real table. Separator rows (|---|) are dropped. ``y_start`` lets the
+    caller place this chunk at its real vertical position on the page.
     """
 
     text = _clean_text(text)
@@ -205,177 +529,188 @@ def _approximate_words_from_text(text: str, width: int, height: int) -> List[Dic
     gap = max(6, width // 180)
 
     words: List[Dict] = []
-    y = margin_y
-    for line in lines:
-        tokens = [token for token in line.split() if token]
-        if not tokens:
-            y += line_height
-            continue
+    y = margin_y if y_start is None else max(margin_y, int(y_start))
+    table_counter = 0
+    in_table = False
+    table_row_index = 0
+    current_line = 0
 
-        x_cursor = width - margin_x
-        for token in tokens:
-            token_width = max(24, min(width - (2 * margin_x), len(token) * char_width + 12))
-            if x_cursor - token_width < margin_x:
-                y += line_height
-                x_cursor = width - margin_x
-            x = x_cursor - token_width
-            words.append(
-                _word_item(
-                    word=token,
-                    confidence=0,
+    for line in lines:
+        # ----- Markdown table row -----
+        if _is_table_row(line):
+            if _is_table_separator(line):
+                continue  # drop the |---|---| line
+            if not in_table:
+                in_table = True
+                table_counter += 1
+                table_row_index = 0
+            cells = _split_table_cells(line)
+            ncols = max(1, len(cells))
+            col_width = max(40, (width - 2 * margin_x) // ncols)
+            row_h = max(22, int(line_height * 0.8))
+            for col, cell in enumerate(cells):
+                # RTL: first cell is on the right
+                x = width - margin_x - (col + 1) * col_width
+                item = _word_item(
+                    word=cell if cell else " ",
+                    confidence=DEEPSEEK_APPROX_CONFIDENCE,
                     x=x,
                     y=y,
-                    w=token_width,
-                    h=max(20, int(line_height * 0.78)),
+                    w=col_width - 4,
+                    h=row_h,
                     width=width,
                     height=height,
                     index=len(words),
                 )
-            )
-            # نص الاحتياط غير موثوق الثقة، لذلك يُظلَّل دائمًا للمراجعة اليدوية.
-            words[-1]["highlighted"] = True
-            words[-1]["wasHighlighted"] = True
-            x_cursor = x - gap
-        y += line_height
-
-    return words
-
-
-# _sort_words_for_arabic_reading_order: ترتيب الكلمات بترتيب القراءة العربي
-# (من الأعلى للأسفل، ثم من اليمين لليسار داخل كل سطر).
-def _sort_words_for_arabic_reading_order(words: List[Dict]) -> List[Dict]:
-    """ترتيب كلمات OCR حسب الترتيب البصري للقراءة العربية.
-
-    يستخدم متوسط ارتفاع الكلمات (median) لتحديد تسامح تجميع الأسطر، ثم يرتّب
-    الأسطر تنازليًا حسب y والكلمات داخل السطر تنازليًا حسب x (يمين ← يسار).
-    """
-
-    indexed_words = []
-    heights = []
-    for original_index, word in enumerate(words or []):
-        bbox = word.get("bounding_box", {}) or {}
-        y = int(bbox.get("y", 0) or 0)
-        h = int(bbox.get("h", 1) or 1)
-        heights.append(h)
-        indexed_words.append(
-            {"word": word, "original_index": original_index, "y": y, "h": h, "x": int(bbox.get("x", 0) or 0)}
-        )
-
-    if not indexed_words:
-        return []
-
-    typical_height = median(heights)
-    line_tolerance = max(6, typical_height * 0.65)
-    lines: List[Dict] = []
-
-    for entry in sorted(indexed_words, key=lambda item: (item["y"], item["x"])):
-        target_line = None
-        for line in lines:
-            if abs(entry["y"] - line["y"]) <= line_tolerance:
-                target_line = line
-                break
-        if target_line is None:
-            lines.append({"y": entry["y"], "items": [entry]})
-        else:
-            target_line["items"].append(entry)
-            target_line["y"] = sum(item["y"] for item in target_line["items"]) / len(target_line["items"])
-
-    sorted_words: List[Dict] = []
-    for line in sorted(lines, key=lambda item: item["y"]):
-        sorted_words.extend(
-            item["word"] for item in sorted(line["items"], key=lambda item: (-item["x"], item["original_index"]))
-        )
-
-    # إعادة ترقيم الفهارس لتبقى متسلسلة بعد إعادة الترتيب.
-    for new_index, word in enumerate(sorted_words):
-        word["index"] = new_index
-
-    return sorted_words
-
-
-# _ocr_page_tesseract: تشغيل Tesseract على صفحة واحدة واستخراج الكلمات وصناديقها.
-def _ocr_page_tesseract(image: Image.Image) -> List[Dict]:
-    """استخراج الكلمات مع bounding_box والثقة عبر Tesseract فقط.
-
-    يستخدم ``image_to_data`` للحصول على إحداثيات وثقة كل كلمة. عند عدم إرجاع
-    أي كلمات ذات صناديق، يلجأ إلى ``image_to_string`` ويبني صناديق تقريبية.
-    """
-
-    width, height = image.size
-    ocr_image = _normalize_for_ocr(image)
-    lang = _preferred_language()
-
-    # إعدادات Tesseract: oem 3 = المحرك الافتراضي، psm 6 = افتراض كتلة نص موحّدة.
-    config = os.getenv("OCR_TESSERACT_CONFIG", "--oem 3 --psm 6")
-
-    data = pytesseract.image_to_data(ocr_image, lang=lang, config=config, output_type=Output.DICT)
-
-    words: List[Dict] = []
-    total = len(data.get("text", []))
-    for i in range(total):
-        text = _clean_word(data["text"][i])
-        if not text:
+                item["table_id"] = table_counter
+                item["table_row"] = table_row_index
+                item["table_col"] = col
+                item["line_index"] = current_line
+                words.append(item)
+            table_row_index += 1
+            y += line_height
+            current_line += 1
             continue
 
-        confidence = _safe_confidence(data.get("conf", [])[i])
-        if confidence < 0:
-            continue
-
-        words.append(
-            _word_item(
-                word=text,
-                confidence=confidence,
-                x=int(data.get("left", [0])[i] or 0),
-                y=int(data.get("top", [0])[i] or 0),
-                w=int(data.get("width", [1])[i] or 1),
-                h=int(data.get("height", [1])[i] or 1),
+        # ----- normal text line -----
+        in_table = False
+        # سطر معادلة كامل ($...$ أو $$...$$): نخرجه ككلمة واحدة موسومة is_math
+        # حتى تعرضه الواجهة كمعادلة منسّقة (KaTeX) بدل تكسيره إلى رموز.
+        stripped_line = line.strip()
+        # نتجاهل نقطة التعداد البادئة (•, -, *) قبل فحص المعادلة.
+        math_core = re.sub(r"^[•\-\*]\s*", "", stripped_line).strip()
+        math_match = re.fullmatch(r"\$\$(.+?)\$\$|\$(.+?)\$", math_core, flags=re.DOTALL)
+        if math_match:
+            latex = (math_match.group(1) or math_match.group(2) or "").strip()
+            display = math_match.group(1) is not None  # $$..$$ = معادلة معروضة
+            item = _word_item(
+                word=math_core,
+                confidence=DEEPSEEK_APPROX_CONFIDENCE,
+                x=margin_x,
+                y=y,
+                w=width - 2 * margin_x,
+                h=max(28, line_height),
                 width=width,
                 height=height,
                 index=len(words),
             )
-        )
+            item["is_math"] = True
+            item["latex"] = latex
+            item["math_display"] = display
+            item["line_index"] = current_line
+            words.append(item)
+            y += line_height
+            current_line += 1
+            continue
 
-    # احتياط: إذا لم تُرجع image_to_data أي كلمات، نستخرج النص الخام ونبني صناديق تقريبية.
-    if not words:
-        plain_text = _clean_word(pytesseract.image_to_string(ocr_image, lang=lang, config=config))
-        if plain_text:
-            words = _approximate_words_from_text(plain_text, width, height)
+        # نقسّم السطر إلى أجزاء: معادلات مغلّفة ($...$ أو $$...$$) ونص عادي،
+        # ثم نكتشف داخل النص أي وحدة معادلة غير مغلّفة (تحوي أوامر LaTeX).
+        raw_parts = re.split(r"(\$\$.+?\$\$|\$.+?\$)", line)
+        segments = []  # (kind, content, display)
+        for part in raw_parts:
+            if not part or not part.strip():
+                continue
+            fenced = re.fullmatch(r"\$\$(.+?)\$\$|\$(.+?)\$", part.strip(), flags=re.DOTALL)
+            if fenced:
+                latex = (fenced.group(1) or fenced.group(2) or "").strip()
+                segments.append(("math", latex, fenced.group(1) is not None))
+            else:
+                for tok in part.split():
+                    # معادلة غير مغلّفة: تحوي أمر LaTeX (\cmd) أو منخفض/مرفوع ({_}/{^}).
+                    if re.search(r"\\[a-zA-Z]+|_\{|\^\{|\\vec", tok):
+                        segments.append(("math", tok, False))
+                    else:
+                        segments.append(("text", tok, False))
 
-    # ترتيب اختياري حسب القراءة العربية، يُفعَّل عبر OCR_SORT_READING_ORDER=true.
-    if os.getenv("OCR_SORT_READING_ORDER", "false").lower() in {"1", "true", "yes", "on"}:
-        words = _sort_words_for_arabic_reading_order(words)
+        if not segments:
+            y += line_height
+            current_line += 1
+            continue
+
+        x_cursor = width - margin_x
+        for kind, content, display in segments:
+            if kind == "math":
+                token_width = max(40, min(width - (2 * margin_x), len(content) * char_width + 16))
+            else:
+                token_width = max(24, min(width - (2 * margin_x), len(content) * char_width + 12))
+            if x_cursor - token_width < margin_x:
+                y += line_height
+                x_cursor = width - margin_x
+            x = x_cursor - token_width
+            item = _word_item(
+                word=(f"${content}$" if kind == "math" else content),
+                confidence=DEEPSEEK_APPROX_CONFIDENCE,
+                x=x,
+                y=y,
+                w=token_width,
+                h=max(20, int(line_height * 0.78)),
+                width=width,
+                height=height,
+                index=len(words),
+            )
+            if kind == "math":
+                item["is_math"] = True
+                item["latex"] = content
+                item["math_display"] = display
+            item["line_index"] = current_line
+            words.append(item)
+            x_cursor = x - gap
+        y += line_height
+        current_line += 1
 
     return words
 
 
-# ocr_with_highlighting: تشغيل OCR على الملف كاملًا وإرجاع نتائج الصفحات للمراجعة.
-def ocr_with_highlighting(file_path: str | os.PathLike[str], output_folder: str | os.PathLike[str]) -> List[Dict]:
-    """تشغيل Tesseract على كل صفحات الملف وإرجاع كلمات قابلة للمراجعة.
+def _ocr_page(image: Image.Image) -> tuple[List[Dict], Dict]:
+    """Run DeepSeek-OCR-2 on a page image and return review-compatible words."""
 
-    لكل صفحة: تُحفظ صورة معاينة (original_page_N.png) لعرضها في الواجهة، ثم
-    تُستخرج الكلمات مع صناديقها وثقتها، مع بيانات المحرك (Tesseract) لكل صفحة.
-    """
+    width, height = image.size
+
+    raw = _deepseek_ocr_raw(image)
+    words = _build_words_with_real_boxes(raw, width, height)
+
+    if not words:
+        raise RuntimeError("DeepSeek-OCR-2 returned empty text")
+
+    highlighted_count = sum(1 for word in words if word.get("highlighted"))
+    print(
+        f"✅ DeepSeek-OCR-2 extracted {len(words)} review words "
+        f"(model={DEEPSEEK_OCR_MODEL_NAME}, highlighted={highlighted_count})."
+    )
+
+    return words, {
+        "ocr_engine": "deepseek",
+        "ocr_engine_label": f"DeepSeek-OCR-2 ({DEEPSEEK_OCR_MODEL_NAME})",
+        "ocr_provider": "deepseek_local",
+        "qari_attempted": False,
+        "fallback_used": False,
+        "fallback_reason": "",
+    }
+
+
+def ocr_with_highlighting(file_path: str | os.PathLike[str], output_folder: str | os.PathLike[str]) -> List[Dict]:
+    """Run OCR and return page-level words with review-compatible boxes."""
 
     output_dir = _prepare_output_folder(output_folder)
     pages = _load_pages(file_path)
-    lang = _preferred_language()
 
     results: List[Dict] = []
     for page_number, image in enumerate(pages, start=1):
         preview_path = output_dir / f"original_page_{page_number}.png"
         image.save(preview_path, format="PNG")
 
-        page_words = _ocr_page_tesseract(image)
+        page_words, engine_info = _ocr_page(image)
         results.append(
             {
                 "page_number": page_number,
                 "image_path": str(preview_path),
                 "text": page_words,
-                "ocr_engine": "tesseract",
-                "ocr_engine_label": f"Tesseract ({lang})",
-                "ocr_provider": "tesseract",
-                "fallback_used": False,
-                "fallback_reason": "",
+                "ocr_engine": engine_info.get("ocr_engine", "unknown"),
+                "ocr_engine_label": engine_info.get("ocr_engine_label", "غير معروف"),
+                "ocr_provider": engine_info.get("ocr_provider", "unknown"),
+                "qari_attempted": engine_info.get("qari_attempted", False),
+                "fallback_used": engine_info.get("fallback_used", False),
+                "fallback_reason": engine_info.get("fallback_reason", ""),
             }
         )
 
