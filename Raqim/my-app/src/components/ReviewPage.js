@@ -33,6 +33,31 @@ const median = (values) => {
   return sorted[Math.floor(sorted.length / 2)];
 };
 
+// ترتيب كلمات السطر من اليمين لليسار (أعلى x أولًا) لعرض عربي صحيح.
+const sortLineWordsRtl = (entries = []) => {
+  return [...entries].sort((a, b) => {
+    const ax = getBoxMetric(a.box, "x", 0);
+    const bx = getBoxMetric(b.box, "x", 0);
+    if (ax !== bx) return bx - ax;
+    return a.index - b.index;
+  });
+};
+
+const lineMetricsFromWords = (entries = []) => {
+  const ys = entries.map((entry) => getBoxMetric(entry.box, "y", null)).filter((value) => value !== null);
+  const bottoms = entries.map((entry) => {
+    const y = getBoxMetric(entry.box, "y", null);
+    if (y === null) return null;
+    return y + getBoxDimension(entry.box, "h", "height", 0);
+  }).filter((value) => value !== null);
+
+  return {
+    y: ys.length ? Math.min(...ys) : null,
+    bottom: bottoms.length ? Math.max(...bottoms) : null,
+    words: sortLineWordsRtl(entries),
+  };
+};
+
 const groupWordsIntoParagraphs = (words = []) => {
   if (!Array.isArray(words) || words.length === 0) return [];
 
@@ -42,33 +67,59 @@ const groupWordsIntoParagraphs = (words = []) => {
   const lineTolerance = Math.max(8, medianHeight * 0.72);
   const paragraphGap = Math.max(18, medianHeight * 1.9);
 
-  const lines = [];
+  const hasStructuredLines = indexedWords.some(
+    ({ word }) => word?.line_index !== undefined && word?.line_index !== null
+  );
 
-  indexedWords.forEach((entry) => {
-    const y = getBoxMetric(entry.box, "y", null);
-    if (y === null || entry.box === null) {
-      const lastLine = lines[lines.length - 1];
-      if (!lastLine || lastLine.words.length >= 18) {
-        lines.push({ y: null, bottom: null, words: [entry] });
-      } else {
-        lastLine.words.push(entry);
+  let lines = [];
+
+  if (hasStructuredLines) {
+    const lineMap = new Map();
+    indexedWords.forEach((entry) => {
+      const blockId = entry.word?.block_id ?? 0;
+      const lineIndex = entry.word?.line_index ?? 0;
+      const key = `${blockId}:${lineIndex}`;
+      if (!lineMap.has(key)) lineMap.set(key, []);
+      lineMap.get(key).push(entry);
+    });
+
+    lines = Array.from(lineMap.entries())
+      .sort(([leftKey], [rightKey]) => {
+        const [leftBlock, leftLine] = leftKey.split(":").map(Number);
+        const [rightBlock, rightLine] = rightKey.split(":").map(Number);
+        if (leftBlock !== rightBlock) return leftBlock - rightBlock;
+        return leftLine - rightLine;
+      })
+      .map(([, entries]) => lineMetricsFromWords(entries));
+  } else {
+    indexedWords.forEach((entry) => {
+      const y = getBoxMetric(entry.box, "y", null);
+      if (y === null || entry.box === null) {
+        const lastLine = lines[lines.length - 1];
+        if (!lastLine || lastLine.words.length >= 18) {
+          lines.push({ y: null, bottom: null, words: [entry] });
+        } else {
+          lastLine.words.push(entry);
+        }
+        return;
       }
-      return;
-    }
 
-    const height = getBoxMetric(entry.box, "h", medianHeight);
-    const bottom = y + height;
-    const lastLine = lines[lines.length - 1];
+      const height = getBoxMetric(entry.box, "h", medianHeight);
+      const bottom = y + height;
+      const lastLine = lines[lines.length - 1];
 
-    if (lastLine && lastLine.y !== null && Math.abs(y - lastLine.y) <= lineTolerance) {
-      const nextCount = lastLine.words.length + 1;
-      lastLine.y = ((lastLine.y * lastLine.words.length) + y) / nextCount;
-      lastLine.bottom = Math.max(lastLine.bottom || bottom, bottom);
-      lastLine.words.push(entry);
-    } else {
-      lines.push({ y, bottom, words: [entry] });
-    }
-  });
+      if (lastLine && lastLine.y !== null && Math.abs(y - lastLine.y) <= lineTolerance) {
+        const nextCount = lastLine.words.length + 1;
+        lastLine.y = ((lastLine.y * lastLine.words.length) + y) / nextCount;
+        lastLine.bottom = Math.max(lastLine.bottom || bottom, bottom);
+        lastLine.words.push(entry);
+      } else {
+        lines.push({ y, bottom, words: [entry] });
+      }
+    });
+
+    lines = lines.map((line) => lineMetricsFromWords(line.words));
+  }
 
   const paragraphs = [];
 
@@ -526,7 +577,7 @@ const ReviewPage = () => {
             <span className="legend-dot"><i></i> كلمات تحتاج انتباه</span>
           </div>
 
-          <div className="extracted-text" onClick={(event) => event.stopPropagation()}>
+          <div className="extracted-text" dir="rtl" onClick={(event) => event.stopPropagation()}>
             {currentBlocks.map((block, blockIndex) => {
               if (block.type === "table") {
                 const rows = buildTableRows(block.words);

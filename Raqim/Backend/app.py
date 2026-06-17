@@ -392,14 +392,7 @@ def _build_corrected_text_from_ocr():
     corrected_pages = []
 
     for page in ocr_results:
-        page_words = []
-        for word_data in page.get("text", []):
-            page_words.append(
-                word_data.get("corrected_word")
-                or word_data.get("word")
-                or ""
-            )
-        page_text = " ".join(word for word in page_words if word).strip()
+        page_text = _page_words_to_rtl_text(page.get("text", []))
         if page_text:
             corrected_pages.append(page_text)
 
@@ -806,9 +799,10 @@ def _extract_ocr_plain_text():
 
     pages_text = []
     for page in ocr_results:
-        page_words = [word.get("word", "") for word in page.get("text", []) if word.get("word")]
-        pages_text.append(" ".join(page_words).strip())
-    return "\n\n".join([page_text for page_text in pages_text if page_text])
+        page_text = _page_words_to_rtl_text(page.get("text", []))
+        if page_text:
+            pages_text.append(page_text)
+    return "\n\n".join(pages_text)
 
 
 def _clean_full_text_llm_response(text):
@@ -1278,7 +1272,7 @@ def process_ocr(file_entry):
         return
 
     # 🔹 تحديث قاعدة البيانات وربط نتائج OCR بالملف الأصلي
-    ocr_text = "\n".join([" ".join([word["word"] for word in page["text"]]) for page in ocr_results])
+    ocr_text = "\n\n".join(_page_words_to_rtl_text(page.get("text", [])) for page in ocr_results)
     ocr_file_id = fs.put(ocr_text.encode("utf-8"), filename=f"ocr_{file_entry['filename']}.txt")
 
     files_collection.update_one(
@@ -1744,6 +1738,96 @@ def _word_display(word_data):
     return (word_data.get("corrected_word") or word_data.get("word") or "").strip()
 
 
+def _word_box_x(word_data):
+    box = word_data.get("bounding_box") or word_data.get("boundingBox") or {}
+    try:
+        return int(box.get("x", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sort_line_words_rtl(words):
+    """رتّب كلمات السطر من اليمين لليسار (أعلى x أولًا)."""
+    return sorted(
+        words,
+        key=lambda w: (
+            -_word_box_x(w),
+            w.get("index", 0),
+        ),
+    )
+
+
+def _group_words_into_lines(words):
+    """قسّم الكلمات إلى أسطر مع الحفاظ على ترتيب RTL داخل كل سطر."""
+    if not words:
+        return []
+
+    has_line_index = any(w.get("line_index") is not None for w in words)
+    if has_line_index:
+        lines_map = {}
+        for word in words:
+            key = (word.get("block_id", 0), word.get("line_index", 0))
+            lines_map.setdefault(key, []).append(word)
+        ordered_keys = sorted(lines_map.keys())
+        return [_sort_line_words_rtl(lines_map[key]) for key in ordered_keys]
+
+    return [_sort_line_words_rtl(words)]
+
+
+def _page_words_to_rtl_text(words):
+    """ابنِ نص الصفحة مع أسطر مرتّبة من اليمين لليسار."""
+    if not words:
+        return ""
+
+    output_parts = []
+    text_run = []
+
+    def flush_text_run():
+        if not text_run:
+            return
+        line_map = {}
+        for word in text_run:
+            key = (word.get("block_id", 0), word.get("line_index", 0))
+            line_map.setdefault(key, []).append(word)
+        for key in sorted(line_map.keys()):
+            line_text = " ".join(
+                _word_display(w) for w in _sort_line_words_rtl(line_map[key]) if _word_display(w)
+            ).strip()
+            if line_text:
+                output_parts.append(line_text)
+        text_run.clear()
+
+    index = 0
+    while index < len(words):
+        word = words[index]
+        table_id = word.get("table_id")
+        if table_id is not None:
+            flush_text_run()
+            table_words = []
+            while index < len(words) and words[index].get("table_id") == table_id:
+                table_words.append(words[index])
+                index += 1
+            rows = {}
+            for cell in table_words:
+                row_index = int(cell.get("table_row", 0))
+                rows.setdefault(row_index, []).append(cell)
+            for row_index in sorted(rows.keys()):
+                row_text = " | ".join(
+                    _word_display(cell)
+                    for cell in sorted(rows[row_index], key=lambda item: int(item.get("table_col", 0)))
+                    if _word_display(cell)
+                ).strip()
+                if row_text:
+                    output_parts.append(row_text)
+            continue
+
+        text_run.append(word)
+        index += 1
+
+    flush_text_run()
+    return "\n".join(output_parts).strip()
+
+
 def _set_rtl_paragraph(paragraph):
     """ضبط اتجاه الفقرة من اليمين لليسار (للعربية)."""
     from docx.oxml.ns import qn
@@ -1892,7 +1976,7 @@ def _build_corrected_docx(path, pages=None):
                 document.add_paragraph("")  # مسافة بعد الجدول
             elif block["type"] == "heading":
                 heading_text = " ".join(
-                    _word_display(w) for w in block["words"] if _word_display(w)
+                    _word_display(w) for w in _sort_line_words_rtl(block["words"]) if _word_display(w)
                 ).strip()
                 if heading_text:
                     p = document.add_heading(level=2)
@@ -1919,7 +2003,7 @@ def _build_corrected_docx(path, pages=None):
                     return len(real) == 1 and real[0].get("is_math") and real[0].get("math_display")
 
                 for li in line_ids:
-                    line_ws = lines_words[li]
+                    line_ws = _sort_line_words_rtl(lines_words[li])
 
                     if _line_is_single_display(line_ws):
                         mw = next(w for w in line_ws if w.get("is_math"))
