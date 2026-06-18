@@ -7,7 +7,14 @@ import shutil
 import threading
 from io import BytesIO
 from werkzeug.security import generate_password_hash, check_password_hash
-from ocr_model import DeepSeekOCRError, ocr_with_highlighting
+from ocr_model import (
+    DeepSeekOCRError,
+    KawnOCRError,
+    get_active_ocr_provider,
+    get_ocr_failure_label,
+    get_pending_ocr_label,
+    ocr_with_highlighting,
+)
 from flask_cors import CORS
 import requests
 import google.generativeai as genai
@@ -221,8 +228,8 @@ ocr_results = []
 original_file_name = ""
 ocr_engine_status = {
     "engine": "pending",
-    "label": "بانتظار المعالجة",
-    "provider": "deepseek_local",
+    "label": get_pending_ocr_label(),
+    "provider": "kawn_api" if get_active_ocr_provider() == "kawn" else "deepseek_local",
 }
 
 # مجلدات التخزين
@@ -1144,8 +1151,8 @@ def upload_file():
     ocr_results = []
     ocr_engine_status = {
         "engine": "pending",
-        "label": "جاري تحميل DeepSeek-OCR-2",
-        "provider": "deepseek_local",
+        "label": get_pending_ocr_label(),
+        "provider": "kawn_api" if get_active_ocr_provider() == "kawn" else "deepseek_local",
     }
 
     if "file" not in request.files:
@@ -1180,7 +1187,7 @@ def upload_file():
 
 
 def _summarize_ocr_engine(pages):
-    """تلخيص محرك DeepSeek-OCR-2 المستخدم في آخر معالجة."""
+    """تلخيص محرك OCR المستخدم في آخر معالجة."""
     if not pages:
         return {
             "engine": "unknown",
@@ -1195,6 +1202,17 @@ def _summarize_ocr_engine(pages):
         "provider": first_page.get("ocr_provider", "deepseek_local"),
     }
 
+
+
+def _ocr_failure_status(error_message: str) -> dict:
+    """Build a consistent OCR failure payload for the active provider."""
+    provider = get_active_ocr_provider()
+    return {
+        "engine": f"{provider}_error",
+        "label": get_ocr_failure_label(),
+        "provider": "kawn_api" if provider == "kawn" else "deepseek_local",
+        "error": error_message,
+    }
 
 
 def process_ocr(file_entry):
@@ -1212,36 +1230,26 @@ def process_ocr(file_entry):
 
     print(f"📂 تحميل الملف من GridFS: {file_entry['filename']}")
 
-    # تشغيل DeepSeek-OCR-2 وتحديث `ocr_results`.
+    # تشغيل محرك OCR المُعدّ وتحديث `ocr_results`.
     try:
         ocr_results = ocr_with_highlighting(temp_file_path, UPLOAD_FOLDER)
         ocr_engine_status = _summarize_ocr_engine(ocr_results)
         print(f"🔎 OCR engine used: {ocr_engine_status['label']} (provider={ocr_engine_status['provider']})")
-    except DeepSeekOCRError as ocr_error:
+    except (DeepSeekOCRError, KawnOCRError) as ocr_error:
         processing_complete = False
         processing_failed = True
         processing_error = str(ocr_error)
         ocr_results = []
-        ocr_engine_status = {
-            "engine": "deepseek_error",
-            "label": "تعذر تشغيل DeepSeek-OCR-2",
-            "provider": "deepseek_local",
-            "error": str(ocr_error),
-        }
-        print(f"❌ تعذر تشغيل DeepSeek-OCR-2: {ocr_error}")
+        ocr_engine_status = _ocr_failure_status(str(ocr_error))
+        print(f"❌ {get_ocr_failure_label()}: {ocr_error}")
         return
     except Exception as ocr_error:
         processing_complete = False
         processing_failed = True
         processing_error = str(ocr_error)
         ocr_results = []
-        ocr_engine_status = {
-            "engine": "deepseek_error",
-            "label": "تعذر تشغيل DeepSeek-OCR-2",
-            "provider": "deepseek_local",
-            "error": str(ocr_error),
-        }
-        print(f"❌ تعذر تشغيل DeepSeek-OCR-2: {ocr_error}")
+        ocr_engine_status = _ocr_failure_status(str(ocr_error))
+        print(f"❌ {get_ocr_failure_label()}: {ocr_error}")
         return
 
     # ✅ **تأكد من عدم احتواء `ocr_results` على بيانات غير صحيحة**
@@ -1270,7 +1278,7 @@ def review_page():
     if processing_failed:
         return jsonify({
             "status": "failed",
-            "error": processing_error or "تعذر تشغيل DeepSeek-OCR-2 على الملف الحالي.",
+            "error": processing_error or f"{get_ocr_failure_label()} على الملف الحالي.",
             "details": processing_error,
             "ocr_engine": ocr_engine_status,
         }), 200
@@ -1584,7 +1592,7 @@ def processing_status():
         if processing_failed:
             return jsonify({
                 "status": "failed",
-                "error": processing_error or "تعذر تشغيل DeepSeek-OCR-2 على الملف الحالي.",
+                "error": processing_error or f"{get_ocr_failure_label()} على الملف الحالي.",
                 "details": processing_error,
                 "ocr_engine": ocr_engine_status,
             }), 200

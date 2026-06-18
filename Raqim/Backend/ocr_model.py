@@ -1,18 +1,14 @@
-"""OCR engine for Raqim with DeepSeek-OCR-2 support.
-
-This module exposes DeepSeek-OCR-2 as Raqim's only OCR engine:
+"""OCR engines for Raqim: local DeepSeek-OCR-2 or cloud Kawn Baseer.
 
 - ``ocr_with_highlighting(file_path, output_folder)`` converts PDF/image input into
   page images and returns OCR words with bounding boxes and confidence highlighting.
 
-DeepSeek-OCR-2 is the active OCR engine for Raqim. It is a vision-language model
-that returns the page text (and HTML tables). Since it does not emit word-level
-bounding boxes, an approximate-box builder reconstructs RTL word boxes (and tagged
-table cells) so the Raqim review workflow keeps working.
+Select the engine with ``OCR_PROVIDER``:
+  - ``deepseek`` (default): local DeepSeek-OCR-2 on an NVIDIA GPU
+  - ``kawn``: Kawn Baseer API (no GPU; requires ``KAWN_API_KEY``)
 
-Note: the model uses custom code (``trust_remote_code=True``), is loaded lazily on
-first use, and requires an NVIDIA GPU. Configure it via the
-``DEEPSEEK_OCR_MODEL_NAME`` environment variable.
+Neither engine emits reliable per-word bounding boxes. An approximate-box builder
+reconstructs RTL word boxes (and tagged table cells) so the review workflow works.
 """
 
 from __future__ import annotations
@@ -26,8 +22,11 @@ from typing import Dict, List
 from pdf2image import convert_from_path
 from PIL import Image
 
+from kawn_ocr import KAWN_OCR_MODEL, KawnOCRError, process_file as kawn_process_file
+
 
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+OCR_PROVIDER = os.getenv("OCR_PROVIDER", "deepseek").strip().lower()
 DEFAULT_DPI = int(os.getenv("OCR_PDF_DPI", "300"))
 DEFAULT_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "80"))
 
@@ -49,8 +48,33 @@ DEEPSEEK_COORD_SCALE = float(os.getenv("DEEPSEEK_COORD_SCALE", "1000.0"))
 _DEEPSEEK_OCR = None
 
 
-class DeepSeekOCRError(RuntimeError):
+class OCRError(RuntimeError):
+    """Raised when OCR inference fails."""
+
+
+class DeepSeekOCRError(OCRError):
     """Raised when DeepSeek-OCR-2 inference fails."""
+
+
+def get_active_ocr_provider() -> str:
+    """Return the configured OCR provider name (``deepseek`` or ``kawn``)."""
+    if OCR_PROVIDER == "kawn":
+        return "kawn"
+    return "deepseek"
+
+
+def get_pending_ocr_label() -> str:
+    """Human-readable label shown while OCR is starting."""
+    if get_active_ocr_provider() == "kawn":
+        return f"جاري معالجة Kawn Baseer ({KAWN_OCR_MODEL})"
+    return "جاري تحميل DeepSeek-OCR-2"
+
+
+def get_ocr_failure_label() -> str:
+    """Human-readable label shown when OCR fails."""
+    if get_active_ocr_provider() == "kawn":
+        return "تعذر تشغيل Kawn Baseer OCR"
+    return "تعذر تشغيل DeepSeek-OCR-2"
 
 
 def configure_tesseract(tesseract_cmd: str | None = None) -> None:
@@ -779,9 +803,78 @@ def _ocr_page(image: Image.Image) -> tuple[List[Dict], Dict]:
     }
 
 
-def ocr_with_highlighting(file_path: str | os.PathLike[str], output_folder: str | os.PathLike[str]) -> List[Dict]:
-    """Run DeepSeek-OCR-2 and return page-level words with review-compatible boxes."""
+def _lookup_kawn_page_content(kawn_pages: List[Dict], page_number: int) -> str:
+    """Return HTML content for a 1-based page number from Kawn results."""
+    target_index = page_number - 1
+    for page in kawn_pages:
+        if int(page.get("index", -1)) == target_index:
+            return str(page.get("content") or "")
+    if 0 <= target_index < len(kawn_pages):
+        return str(kawn_pages[target_index].get("content") or "")
+    return ""
 
+
+def _ocr_with_kawn_highlighting(
+    file_path: str | os.PathLike[str], output_folder: str | os.PathLike[str]
+) -> List[Dict]:
+    """Run Kawn Baseer OCR and return page-level words with review-compatible boxes."""
+    output_dir = _prepare_output_folder(output_folder)
+    try:
+        page_images = _load_pages(file_path)
+    except Exception as exc:
+        raise KawnOCRError(f"تعذر قراءة ملف OCR: {exc}") from exc
+
+    try:
+        kawn_result = kawn_process_file(file_path)
+    except KawnOCRError:
+        raise
+    except Exception as exc:
+        raise KawnOCRError(f"تعذر تشغيل Kawn Baseer OCR: {exc}") from exc
+
+    kawn_pages = sorted(kawn_result.get("pages") or [], key=lambda page: int(page.get("index", 0)))
+    model_name = str(kawn_result.get("model") or KAWN_OCR_MODEL)
+    credits = kawn_result.get("creditsConsumed")
+    if credits is not None:
+        print(f"☁️ Kawn OCR credits consumed: {credits}")
+
+    results: List[Dict] = []
+    for page_number, image in enumerate(page_images, start=1):
+        preview_path = output_dir / f"original_page_{page_number}.png"
+        image.save(preview_path, format="PNG")
+
+        width, height = image.size
+        html_content = _lookup_kawn_page_content(kawn_pages, page_number)
+        structured = _clean_text(html_content)
+        page_words = _words_from_structured_text(structured, width, height)
+
+        if not page_words:
+            raise KawnOCRError(f"Kawn OCR لم يستخرج نصاً للصفحة {page_number}.")
+
+        print(
+            f"✅ Kawn Baseer extracted {len(page_words)} review words "
+            f"(page={page_number}, model={model_name})."
+        )
+        results.append(
+            {
+                "page_number": page_number,
+                "image_path": str(preview_path),
+                "text": page_words,
+                "ocr_engine": "kawn",
+                "ocr_engine_label": f"Kawn Baseer ({model_name})",
+                "ocr_provider": "kawn_api",
+                "qari_attempted": False,
+                "fallback_used": False,
+                "fallback_reason": "",
+            }
+        )
+
+    return results
+
+
+def _ocr_with_deepseek_highlighting(
+    file_path: str | os.PathLike[str], output_folder: str | os.PathLike[str]
+) -> List[Dict]:
+    """Run DeepSeek-OCR-2 and return page-level words with review-compatible boxes."""
     output_dir = _prepare_output_folder(output_folder)
     try:
         pages = _load_pages(file_path)
@@ -815,3 +908,10 @@ def ocr_with_highlighting(file_path: str | os.PathLike[str], output_folder: str 
         )
 
     return results
+
+
+def ocr_with_highlighting(file_path: str | os.PathLike[str], output_folder: str | os.PathLike[str]) -> List[Dict]:
+    """Run the configured OCR engine and return review-compatible page results."""
+    if get_active_ocr_provider() == "kawn":
+        return _ocr_with_kawn_highlighting(file_path, output_folder)
+    return _ocr_with_deepseek_highlighting(file_path, output_folder)
