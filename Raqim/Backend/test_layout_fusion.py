@@ -4,8 +4,13 @@ These tests exercise the pure merge logic (``enhance_layout_with_dotocr``) with
 synthetic DeepSeek pages and synthetic DotOCR layout regions — no OCR models are
 loaded.
 
-Phase 1 (this commit): Title / Section-header -> ``block_type == "heading"``,
-plus the two hard rules: DeepSeek text is never replaced, and DotOCR failure
+Covered phases:
+
+* Phase 1: Title / Section-header -> ``block_type == "heading"``.
+* Phase 2: Table region -> Raqim table structure (reusing DotOCR HTML), without
+  clobbering tables DeepSeek already detected.
+
+Plus the two hard rules: DeepSeek text is never replaced, and DotOCR failure
 degrades gracefully to the DeepSeek-only result.
 """
 
@@ -129,6 +134,68 @@ def test_page_marked_as_fused():
     assert fused[0]["fusion"] is True
     assert fused[0]["layout_engine"] == "dots"
     assert "DotOCR" in fused[0]["ocr_engine_label"]
+
+
+def test_phase2_table_from_dotocr_html():
+    # A page where DeepSeek saw plain text where DotOCR detects a table.
+    pages = [
+        _page(
+            [
+                _word("بيانات", 0, 700, 600, 90, 36),
+                _word("الجدول", 0, 600, 600, 90, 36),
+            ]
+        )
+    ]
+    html = "<table><tr><td>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></table>"
+    layout = [[{"category": "Table", "bbox": [550, 560, 950, 760], "text": html}]]
+
+    fused = layout_fusion.enhance_layout_with_dotocr(pages, layout)
+    words = fused[0]["text"]
+    table_words = [w for w in words if w["block_type"] == "table"]
+    assert table_words, "expected a reconstructed table block"
+    # The cells carry table_row/table_col so the review UI + docx can render it.
+    assert all("table_row" in w and "table_col" in w for w in table_words)
+    cell_text = {w["word"] for w in table_words}
+    assert {"A", "B", "C", "D"} <= cell_text
+    # The original DeepSeek plain-text fragment is replaced by the table.
+    assert "بيانات" not in cell_text
+
+
+def test_phase2_keeps_existing_deepseek_table():
+    # DeepSeek already produced a real table; fusion must not rebuild it.
+    table_word = _word("X", 0, 700, 600, 90, 36, block_type="table")
+    table_word["table_id"] = 1
+    table_word["table_row"] = 0
+    table_word["table_col"] = 0
+    pages = [_page([table_word])]
+    html = "<table><tr><td>Z</td></tr></table>"
+    layout = [[{"category": "Table", "bbox": [550, 560, 950, 760], "text": html}]]
+
+    fused = layout_fusion.enhance_layout_with_dotocr(pages, layout)
+    words = fused[0]["text"]
+    assert {w["word"] for w in words} == {"X"}  # DeepSeek cell text preserved.
+    assert "Z" not in {w["word"] for w in words}
+
+
+def test_phase2_unparsable_table_keeps_text():
+    pages = [_page([_word("نص", 0, 700, 600, 90, 36)])]
+    # Table category but no parseable HTML -> keep the DeepSeek text.
+    layout = [[{"category": "Table", "bbox": [550, 560, 950, 760], "text": "not a table"}]]
+
+    fused = layout_fusion.enhance_layout_with_dotocr(pages, layout)
+    words = fused[0]["text"]
+    assert {w["word"] for w in words} == {"نص"}
+    assert all(w["block_type"] != "table" for w in words)
+
+
+def test_phase2_can_be_disabled():
+    pages = [_page([_word("نص", 0, 700, 600, 90, 36)])]
+    html = "<table><tr><td>A</td></tr></table>"
+    layout = [[{"category": "Table", "bbox": [550, 560, 950, 760], "text": html}]]
+
+    fused = layout_fusion.enhance_layout_with_dotocr(pages, layout, enable_tables=False)
+    words = fused[0]["text"]
+    assert {w["word"] for w in words} == {"نص"}
 
 
 def test_run_fusion_ocr_degrades_when_dotocr_unavailable(monkeypatch):

@@ -29,9 +29,15 @@ Hard rules (enforced here)
 * If DotOCR is unavailable or fails, the DeepSeek-only result is returned
   untouched (graceful degradation).
 
-Phase 1 (this commit): detect ``Title`` / ``Section-header`` regions and convert
-the matching DeepSeek blocks into ``block_type == "heading"``. Tables and
-pictures are handled in later phases.
+Phases implemented so far:
+
+* Phase 1: detect ``Title`` / ``Section-header`` regions and convert the matching
+  DeepSeek blocks into ``block_type == "heading"``.
+* Phase 2: detect ``Table`` regions and, where DeepSeek only produced plain text,
+  rebuild a real Raqim table block from DotOCR's HTML table output (DeepSeek
+  tables that were already detected are kept untouched).
+
+Pictures and the TOC-friendly heading hierarchy are handled in a later phase.
 
 The expensive merge orchestration (``run_fusion_ocr``) lazily imports the heavy
 engines, while the pure merge logic (``enhance_layout_with_dotocr`` and helpers)
@@ -50,6 +56,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 TITLE_CATEGORIES = {"title"}
 SECTION_CATEGORIES = {"section-header", "sectionheader", "section_header", "subtitle", "sub-title", "sub_title", "header"}
 HEADING_CATEGORIES = TITLE_CATEGORIES | SECTION_CATEGORIES
+TABLE_CATEGORIES = {"table"}
 
 # Minimum fraction of a DeepSeek block that must fall inside a DotOCR region for
 # the block to inherit that region's structural role.
@@ -237,6 +244,101 @@ def _best_region(
 
 
 # ---------------------------------------------------------------------------
+# Table reconstruction from DotOCR HTML (Phase 2).
+# ---------------------------------------------------------------------------
+def _extract_table_html(text) -> Optional[str]:
+    """Return the ``<table>...</table>`` fragment from a DotOCR cell, if any."""
+    if not text:
+        return None
+    match = re.search(r"<table[^>]*>.*?</table>", str(text), flags=re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(0)
+    # DotOCR may emit a bare table without the wrapping tag for some pages.
+    if "<tr" in str(text).lower():
+        return str(text)
+    return None
+
+
+def _table_words_from_html(html: str, table_id: int, width: float, height: float, y_start: Optional[int]) -> List[Dict]:
+    """Build Raqim table words from a DotOCR HTML table (lazy ocr_model import).
+
+    Reuses ``ocr_model``'s battle-tested HTML-table parser and RTL cell layout so
+    the resulting cells (``table_id`` / ``table_row`` / ``table_col`` / spans)
+    are identical in shape to DeepSeek's own tables — the review UI and
+    ``docx_builder`` render them with no special-casing.
+    """
+    import ocr_model
+
+    cells = ocr_model._parse_html_table_cells(html)
+    if not cells:
+        return []
+    return ocr_model._table_cells_to_words(
+        cells, table_id, int(width) or 1000, int(height) or 1000, y_start=y_start
+    )
+
+
+def _apply_table_fusion(
+    blocks: List[Dict],
+    regions: Sequence[Dict],
+    width: float,
+    height: float,
+    threshold: float,
+) -> Tuple[List[Dict], int]:
+    """Replace DeepSeek text blocks that fall inside a DotOCR table region.
+
+    Returns the new block list and the number of tables reconstructed. Tables
+    DeepSeek already detected (``block_type == "table"``) are kept untouched so
+    DeepSeek stays the source of truth where it succeeded.
+    """
+    table_regions = [r for r in regions if r["category"] in TABLE_CATEGORIES and _extract_table_html(r.get("text"))]
+    if not table_regions:
+        return blocks, 0
+
+    new_blocks: List[Dict] = []
+    handled_regions: set = set()
+    table_count = 0
+
+    for block in blocks:
+        rect = block.get("rect")
+        matched_idx = None
+        if rect is not None and block["block_type"] != "table":
+            for region_idx, region in enumerate(table_regions):
+                if _containment(rect, region["rect"]) >= threshold:
+                    matched_idx = region_idx
+                    break
+
+        if matched_idx is None:
+            new_blocks.append(block)
+            continue
+
+        if matched_idx in handled_regions:
+            # Region already converted; drop this extra text fragment so we do
+            # not duplicate the table content.
+            continue
+
+        region = table_regions[matched_idx]
+        html = _extract_table_html(region["text"])
+        y_start = int(region["rect"][1] * height) + 4
+        table_words = _table_words_from_html(html, len(new_blocks) + 1, width, height, y_start)
+        if not table_words:
+            # Could not parse the HTML table; keep the DeepSeek text block.
+            new_blocks.append(block)
+            continue
+
+        handled_regions.add(matched_idx)
+        for word in table_words:
+            word["block_type"] = "table"
+            word["layout_source"] = "dotocr"
+            word["dots_category"] = "table"
+        new_blocks.append(
+            {"block_id": None, "block_type": "table", "words": table_words, "rect": region["rect"]}
+        )
+        table_count += 1
+
+    return new_blocks, table_count
+
+
+# ---------------------------------------------------------------------------
 # Public merge entry point.
 # ---------------------------------------------------------------------------
 def enhance_layout_with_dotocr(
@@ -244,6 +346,7 @@ def enhance_layout_with_dotocr(
     layout_pages: Sequence[Sequence[Dict]],
     *,
     enable_headings: bool = True,
+    enable_tables: bool = True,
     overlap_threshold: float = DEFAULT_OVERLAP_THRESHOLD,
 ) -> List[Dict]:
     """Fuse DeepSeek OCR pages with DotOCR layout regions.
@@ -259,6 +362,8 @@ def enhance_layout_with_dotocr(
         ``text``. Use an empty list for pages where DotOCR produced nothing.
     enable_headings:
         Phase 1 switch for Title / Section-header detection.
+    enable_tables:
+        Phase 2 switch for Table detection (reuse DotOCR HTML structure).
     overlap_threshold:
         Minimum containment fraction for a DeepSeek block to inherit a DotOCR
         region's role.
@@ -289,6 +394,7 @@ def enhance_layout_with_dotocr(
             block["rect"] = _block_rect(block, width, height)
 
         heading_count = 0
+        table_count = 0
 
         # ---- Phase 1: Title / Section-header detection -------------------
         if enable_headings:
@@ -305,11 +411,15 @@ def enhance_layout_with_dotocr(
                 block["block_type"] = "heading"
                 heading_count += 1
 
+        # ---- Phase 2: Table detection (reuse DotOCR HTML structure) ------
+        if enable_tables:
+            blocks, table_count = _apply_table_fusion(blocks, regions, width, height, overlap_threshold)
+
         page["text"] = _flatten_blocks(blocks)
         _mark_page_fused(page)
         print(
             f"🔗 Layout fusion page {page.get('page_number', page_index + 1)}: "
-            f"headings={heading_count}."
+            f"headings={heading_count}, tables={table_count}."
         )
 
     return fused_pages
