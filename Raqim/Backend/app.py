@@ -8,6 +8,7 @@ import threading
 from io import BytesIO
 from werkzeug.security import generate_password_hash, check_password_hash
 from ocr_model import DeepSeekOCRError, ocr_with_highlighting
+from post_processor import post_processor
 from flask_cors import CORS
 import requests
 import google.generativeai as genai
@@ -125,42 +126,8 @@ def _get_arabic_checker_client():
 
 
 def get_arabic_checker_suggestions(word, max_suggestions=5):
-    """استدعاء المدقق العربي (أداة Gradio) وإرجاع اقتراحات تصحيح للكلمة.
-
-    شكل الإخراج من الأداة: نص JSON فيه "corrections"، كل عنصر يحوي
-    "incorrect_token" و"suggested_corrections" (قائمة قوائم) و"explanation".
-    نرجع قائمة عناصر بالشكل {word, source, reason} لتتوافق مع واجهة المراجعة.
-    """
-    original_word = (word or "").strip()
-    if not original_word or not ARABIC_CHECKER_ENABLED:
-        return []
-
-    try:
-        client = _get_arabic_checker_client()
-        raw = client.predict(sent=original_word, api_name=ARABIC_CHECKER_API_NAME)
-        data = raw if isinstance(raw, dict) else json.loads(raw)
-    except Exception as e:
-        print(f"❌ خطأ في المدقق العربي (Gradio): {e}")
-        return []
-
-    items = []
-    for correction in (data.get("corrections", []) if isinstance(data, dict) else []):
-        explanations = correction.get("explanation") or []
-        reason = explanations[0] if isinstance(explanations, list) and explanations else "اقتراح من المدقق العربي"
-        for group in correction.get("suggested_corrections", []) or []:
-            candidates = group if isinstance(group, list) else [group]
-            for candidate in candidates:
-                candidate = (str(candidate) if candidate is not None else "").strip()
-                if candidate and candidate != original_word:
-                    items.append({"word": candidate, "source": "arabic_checker", "reason": str(reason)[:120]})
-
-    # إزالة التكرار مع الحفاظ على الترتيب
-    deduped, seen = [], set()
-    for item in items:
-        if item["word"] not in seen:
-            seen.add(item["word"])
-            deduped.append(item)
-    return deduped[:max_suggestions]
+    """تم تعطيل الاقتراحات الذكية برمجياً بناءً على طلب المستخدم."""
+    return []
 
 
 # ============================================================================
@@ -172,43 +139,8 @@ GEMINI_ENABLED = bool(API_KEY)
 
 
 def get_gemini_suggestions(word, context="", max_suggestions=5):
-    """اقتراحات تصحيح إملائي للكلمة العربية عبر Gemini.
-
-    يرسل الكلمة (مع سياقها إن وُجد) ويطلب بدائل مصحّحة فقط. يُرجع عناصر بالشكل
-    {word, source, reason}. يفشل بهدوء (يرجع []) عند غياب المفتاح أو أي خطأ.
-    """
-    word = (word or "").strip()
-    if not word or not GEMINI_ENABLED or model is None:
-        return []
-
-    context_line = f"\nالسياق: {context.strip()}" if context and context.strip() else ""
-    prompt = (
-        "أنت مدقق إملائي للعربية. صحّح الكلمة التالية إن كان بها خطأ إملائي ناتج "
-        "عن التعرّف الضوئي (OCR). أعد فقط البدائل الصحيحة المحتملة، الأكثر ترجيحًا "
-        "أولًا، مفصولة بفواصل، دون أي شرح أو جُمل. إن كانت الكلمة صحيحة فأعد الكلمة "
-        f"نفسها فقط.\nالكلمة: {word}{context_line}"
-    )
-
-    try:
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.2, max_output_tokens=60
-            ),
-        )
-        text = (response.text or "").strip()
-    except Exception as e:
-        print(f"❌ خطأ في Gemini: {e}")
-        return []
-
-    candidates = re.split(r"[,،\n]+", text)
-    items, seen = [], set()
-    for cand in candidates:
-        cand = cand.strip().strip(".").strip()
-        if cand and cand != word and cand not in seen:
-            seen.add(cand)
-            items.append({"word": cand, "source": "gemini", "reason": "اقتراح من Gemini"})
-    return items[:max_suggestions]
+    """تم تعطيل الاقتراحات الذكية برمجياً بناءً على طلب المستخدم."""
+    return []
 
 
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key")
@@ -710,86 +642,8 @@ def get_allam_correction_suggestions(word, context="", page_number=None, max_sug
 
 
 def get_llm_correction_suggestions(word, context="", confidence=None, max_suggestions=4):
-    """إرجاع اقتراحات LLM لكلمة OCR واحدة دون تطبيقها تلقائيًا."""
-    original_word = (word or "").strip()
-    if not original_word:
-        return []
-
-    if not LLM_SUGGESTIONS_ENABLED or not LLM_SUGGESTIONS_API_BASE_URL or not LLM_SUGGESTIONS_API_KEY:
-        return []
-
-    context = (context or "").strip()
-    confidence_text = "غير متاح" if confidence is None else str(confidence)
-
-    system_prompt = (
-        "أنت مساعد متخصص في مراجعة كلمات OCR العربية والإنجليزية. "
-        "أعد اقتراحات تصحيح قصيرة فقط للكلمة المحددة، ولا تغيّر المعنى، ولا تشرح خارج JSON. "
-        "إذا كانت الكلمة صحيحة أو غير مؤكدة، أعد قائمة فارغة."
-    )
-    user_prompt = f"""راجع الكلمة المحددة المستخرجة من OCR واقترح بدائل تصحيح محتملة فقط إذا كان هناك خطأ واضح.
-
-القواعد:
-- أعد JSON صالحًا فقط بالشكل: {{"suggestions":[{{"word":"...","reason":"..."}}]}}
-- اجعل عدد الاقتراحات من 0 إلى {max_suggestions}.
-- الاقتراح يجب أن يكون كلمة واحدة أو عبارة قصيرة جدًا، عربيًا أو إنجليزيًا حسب السياق.
-- لا تطبق التصحيح، ولا تعد النص كاملًا، ولا تضف شرحًا خارج JSON.
-
-الكلمة: {original_word}
-ثقة OCR: {confidence_text}
-السياق القريب: {context}
-"""
-
-    payload = {
-        "model": LLM_SUGGESTIONS_MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 700,
-        "reasoning": {"effort": "minimal"},
-        "response_format": {"type": "json_object"},
-    }
-
-    try:
-        response = requests.post(
-            f"{LLM_SUGGESTIONS_API_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {LLM_SUGGESTIONS_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=LLM_SUGGESTIONS_TIMEOUT_SECONDS,
-        )
-
-        # بعض النماذج أو البروكسيات قد لا تدعم response_format؛ نعيد المحاولة بدونها بدل تعطيل الميزة.
-        if response.status_code in {400, 422}:
-            payload.pop("response_format", None)
-            response = requests.post(
-                f"{LLM_SUGGESTIONS_API_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {LLM_SUGGESTIONS_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=LLM_SUGGESTIONS_TIMEOUT_SECONDS,
-            )
-
-        response.raise_for_status()
-        data = response.json()
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        parsed = _parse_json_safely(content)
-        raw_suggestions = parsed.get("suggestions", [])
-        if isinstance(raw_suggestions, str):
-            raw_suggestions = [raw_suggestions]
-        if not isinstance(raw_suggestions, list):
-            raw_suggestions = []
-
-        items = [_normalise_suggestion_item(item, original_word, source="llm") for item in raw_suggestions]
-        return _dedupe_suggestion_items(items)[:max_suggestions]
-    except Exception as e:
-        print(f"❌ خطأ في اقتراحات LLM: {e}")
-        return []
+    """تم تعطيل الاقتراحات الذكية برمجياً بناءً على طلب المستخدم."""
+    return []
 
 
 def _extract_ocr_plain_text():
@@ -1249,8 +1103,11 @@ def process_ocr(file_entry):
         print("❌ خطأ: لم يتم استخراج أي نصوص صحيحة!")
         return
 
+    # 🔹 تطبيق المعالجة اللاحقة لتحسين التنسيق برمجياً
+    ocr_text_raw = "\n".join([" ".join([word["word"] for word in page["text"]]) for page in ocr_results])
+    ocr_text = post_processor.process_text(ocr_text_raw)
+    
     # 🔹 تحديث قاعدة البيانات وربط نتائج OCR بالملف الأصلي
-    ocr_text = "\n".join([" ".join([word["word"] for word in page["text"]]) for page in ocr_results])
     ocr_file_id = fs.put(ocr_text.encode("utf-8"), filename=f"ocr_{file_entry['filename']}.txt")
 
     files_collection.update_one(
