@@ -7,7 +7,12 @@ engine (DeepSeek-OCR-2 or DotOCR) that emits this structure gets the same layout
 reconstruction:
 
 * ``block_type == "table"``   -> a real Word table (with merged cells, RTL).
-* ``block_type == "heading"`` -> a Word heading (level 2).
+* ``block_type == "heading"`` -> a Word heading; the level honors a per-block
+                                  ``heading_level`` (Title -> 1, Section -> 2)
+                                  when present (TOC-friendly), else level 2.
+* ``block_type == "picture"`` -> a centered, italic placeholder paragraph (the
+                                  layout-fusion engine emits these for detected
+                                  image regions that carry no OCR text).
 * otherwise                    -> RTL paragraphs in reading order, with inline
                                   math rendered as OMML equations.
 
@@ -176,11 +181,34 @@ def build_corrected_docx(path, pages):
                     _word_display(w) for w in block["words"] if _word_display(w)
                 ).strip()
                 if heading_text:
-                    p = document.add_heading(level=2)
+                    # TOC-friendly hierarchy: honor a per-block heading level
+                    # (Title -> 1, Section-header -> 2) when the layout-fusion
+                    # engine provides one; default to 2 for older outputs.
+                    level = 2
+                    for w in block["words"]:
+                        try:
+                            level = int(w.get("heading_level") or level)
+                        except (TypeError, ValueError):
+                            pass
+                        break
+                    level = min(max(level, 1), 9)
+                    p = document.add_heading(level=level)
                     run = p.add_run(heading_text)
                     run.font.name = "Arial"
                     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
                     _set_rtl_paragraph(p)
+            elif block["type"] == "picture":
+                # Detected (DotOCR) image region: DeepSeek emits no text for it,
+                # so we add a clearly-marked, centered placeholder paragraph.
+                picture_text = " ".join(
+                    _word_display(w) for w in block["words"] if _word_display(w)
+                ).strip() or "[صورة]"
+                p = document.add_paragraph()
+                run = p.add_run(picture_text)
+                run.font.name = "Arial"
+                run.italic = True
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _set_rtl_paragraph(p)
             else:
                 # نبني الكتلة سطرًا بسطر مع دعم المعادلات داخل السطر (inline).
                 # كل سطر يحوي كلماته بالترتيب (نص أو معادلة)، فنضيفها في فقرة واحدة.

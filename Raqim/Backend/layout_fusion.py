@@ -36,8 +36,10 @@ Phases implemented so far:
 * Phase 2: detect ``Table`` regions and, where DeepSeek only produced plain text,
   rebuild a real Raqim table block from DotOCR's HTML table output (DeepSeek
   tables that were already detected are kept untouched).
-
-Pictures and the TOC-friendly heading hierarchy are handled in a later phase.
+* Phase 3: detect ``Picture`` regions (DeepSeek emits no text for images) and
+  insert an editable placeholder block at the right reading position, plus a
+  TOC-friendly heading hierarchy (``heading_level`` 1 for Title, 2 for
+  Section-header) consumed by ``docx_builder``.
 
 The expensive merge orchestration (``run_fusion_ocr``) lazily imports the heavy
 engines, while the pure merge logic (``enhance_layout_with_dotocr`` and helpers)
@@ -57,10 +59,20 @@ TITLE_CATEGORIES = {"title"}
 SECTION_CATEGORIES = {"section-header", "sectionheader", "section_header", "subtitle", "sub-title", "sub_title", "header"}
 HEADING_CATEGORIES = TITLE_CATEGORIES | SECTION_CATEGORIES
 TABLE_CATEGORIES = {"table"}
+PICTURE_CATEGORIES = {"picture", "figure", "image"}
 
 # Minimum fraction of a DeepSeek block that must fall inside a DotOCR region for
 # the block to inherit that region's structural role.
 DEFAULT_OVERLAP_THRESHOLD = 0.5
+
+# Placeholder text used for a detected Picture region (DeepSeek emits no text for
+# images, so we inject a clearly-marked, editable placeholder block instead).
+PICTURE_PLACEHOLDER = "[صورة]"
+
+
+def _heading_level_for(category: str) -> int:
+    """TOC-friendly heading level: Title -> 1, Section-header/others -> 2."""
+    return 1 if category in TITLE_CATEGORIES else 2
 
 
 def _normalize_category(category) -> str:
@@ -339,6 +351,85 @@ def _apply_table_fusion(
 
 
 # ---------------------------------------------------------------------------
+# Picture detection (Phase 3).
+# ---------------------------------------------------------------------------
+def _picture_placeholder_words(width: float, height: float, y_start: Optional[int]) -> List[Dict]:
+    """Build a single editable placeholder word for a detected Picture region."""
+    import ocr_model
+
+    pw = int(width) or 1000
+    ph = int(height) or 1000
+    margin_x = max(18, pw // 35)
+    y = margin_x if y_start is None else max(margin_x, int(y_start))
+    item = ocr_model._word_item(
+        word=PICTURE_PLACEHOLDER,
+        confidence=ocr_model.DEEPSEEK_APPROX_CONFIDENCE,
+        x=margin_x,
+        y=y,
+        w=pw - 2 * margin_x,
+        h=max(40, ph // 12),
+        width=pw,
+        height=ph,
+        index=0,
+    )
+    item["line_index"] = 0
+    item["is_picture"] = True
+    return [item]
+
+
+def _insert_block_by_position(blocks: List[Dict], new_block: Dict) -> None:
+    """Insert ``new_block`` into ``blocks`` preserving top-to-bottom reading order."""
+    new_rect = new_block.get("rect")
+    if new_rect is None:
+        blocks.append(new_block)
+        return
+    new_top = new_rect[1]
+    for idx, block in enumerate(blocks):
+        rect = block.get("rect")
+        if rect is not None and rect[1] > new_top:
+            blocks.insert(idx, new_block)
+            return
+    blocks.append(new_block)
+
+
+def _apply_picture_fusion(
+    blocks: List[Dict],
+    regions: Sequence[Dict],
+    width: float,
+    height: float,
+    threshold: float,
+) -> int:
+    """Insert placeholder blocks for DotOCR Picture regions; return the count.
+
+    A picture region that is already covered by a real content block (e.g. a
+    figure with an embedded caption DeepSeek read as text) is skipped so we do
+    not duplicate content.
+    """
+    picture_regions = [r for r in regions if r["category"] in PICTURE_CATEGORIES]
+    picture_count = 0
+    for region in picture_regions:
+        overlapped = any(
+            block.get("rect") is not None
+            and _containment(region["rect"], block["rect"]) >= threshold
+            for block in blocks
+        )
+        if overlapped:
+            continue
+        y_start = int(region["rect"][1] * height) + 4
+        placeholder = _picture_placeholder_words(width, height, y_start)
+        for word in placeholder:
+            word["block_type"] = "picture"
+            word["layout_source"] = "dotocr"
+            word["dots_category"] = "picture"
+        _insert_block_by_position(
+            blocks,
+            {"block_id": None, "block_type": "picture", "words": placeholder, "rect": region["rect"]},
+        )
+        picture_count += 1
+    return picture_count
+
+
+# ---------------------------------------------------------------------------
 # Public merge entry point.
 # ---------------------------------------------------------------------------
 def enhance_layout_with_dotocr(
@@ -347,6 +438,7 @@ def enhance_layout_with_dotocr(
     *,
     enable_headings: bool = True,
     enable_tables: bool = True,
+    enable_pictures: bool = True,
     overlap_threshold: float = DEFAULT_OVERLAP_THRESHOLD,
 ) -> List[Dict]:
     """Fuse DeepSeek OCR pages with DotOCR layout regions.
@@ -364,6 +456,8 @@ def enhance_layout_with_dotocr(
         Phase 1 switch for Title / Section-header detection.
     enable_tables:
         Phase 2 switch for Table detection (reuse DotOCR HTML structure).
+    enable_pictures:
+        Phase 3 switch for Picture detection (insert editable placeholders).
     overlap_threshold:
         Minimum containment fraction for a DeepSeek block to inherit a DotOCR
         region's role.
@@ -395,6 +489,7 @@ def enhance_layout_with_dotocr(
 
         heading_count = 0
         table_count = 0
+        picture_count = 0
 
         # ---- Phase 1: Title / Section-header detection -------------------
         if enable_headings:
@@ -404,8 +499,11 @@ def enhance_layout_with_dotocr(
                 region = _best_region(block["rect"], regions, HEADING_CATEGORIES, overlap_threshold)
                 if region is None:
                     continue
+                # Phase 3: TOC-friendly hierarchy (Title -> 1, Section -> 2).
+                level = _heading_level_for(region["category"])
                 for word in block["words"]:
                     word["block_type"] = "heading"
+                    word["heading_level"] = level
                     word["layout_source"] = "dotocr"
                     word["dots_category"] = region["category"]
                 block["block_type"] = "heading"
@@ -415,11 +513,15 @@ def enhance_layout_with_dotocr(
         if enable_tables:
             blocks, table_count = _apply_table_fusion(blocks, regions, width, height, overlap_threshold)
 
+        # ---- Phase 3: Picture detection ---------------------------------
+        if enable_pictures:
+            picture_count = _apply_picture_fusion(blocks, regions, width, height, overlap_threshold)
+
         page["text"] = _flatten_blocks(blocks)
         _mark_page_fused(page)
         print(
             f"🔗 Layout fusion page {page.get('page_number', page_index + 1)}: "
-            f"headings={heading_count}, tables={table_count}."
+            f"headings={heading_count}, tables={table_count}, pictures={picture_count}."
         )
 
     return fused_pages

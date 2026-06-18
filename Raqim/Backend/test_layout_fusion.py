@@ -9,6 +9,7 @@ Covered phases:
 * Phase 1: Title / Section-header -> ``block_type == "heading"``.
 * Phase 2: Table region -> Raqim table structure (reusing DotOCR HTML), without
   clobbering tables DeepSeek already detected.
+* Phase 3: Picture detection + TOC-friendly heading hierarchy (heading levels).
 
 Plus the two hard rules: DeepSeek text is never replaced, and DotOCR failure
 degrades gracefully to the DeepSeek-only result.
@@ -196,6 +197,65 @@ def test_phase2_can_be_disabled():
     fused = layout_fusion.enhance_layout_with_dotocr(pages, layout, enable_tables=False)
     words = fused[0]["text"]
     assert {w["word"] for w in words} == {"نص"}
+
+
+def test_phase3_heading_hierarchy_levels():
+    pages = [_simple_page()]
+    title_layout = [[{"category": "Title", "bbox": [290, 40, 500, 100], "text": "x"}]]
+    section_layout = [[{"category": "Section-header", "bbox": [290, 40, 500, 100], "text": "x"}]]
+
+    title_fused = layout_fusion.enhance_layout_with_dotocr(pages, title_layout)
+    section_fused = layout_fusion.enhance_layout_with_dotocr(pages, section_layout)
+
+    title_headings = [w for w in title_fused[0]["text"] if w["block_type"] == "heading"]
+    section_headings = [w for w in section_fused[0]["text"] if w["block_type"] == "heading"]
+    assert all(w["heading_level"] == 1 for w in title_headings)
+    assert all(w["heading_level"] == 2 for w in section_headings)
+
+
+def test_phase3_picture_detection_adds_placeholder():
+    pages = [_simple_page()]
+    layout = [[{"category": "Picture", "bbox": [100, 900, 900, 1200]}]]
+
+    fused = layout_fusion.enhance_layout_with_dotocr(pages, layout)
+    pictures = [w for w in fused[0]["text"] if w.get("block_type") == "picture"]
+    assert pictures, "expected a picture placeholder block"
+    assert pictures[0].get("is_picture") is True
+    assert pictures[0]["word"] == layout_fusion.PICTURE_PLACEHOLDER
+
+
+def test_phase3_picture_skipped_when_overlapping_text():
+    # Picture bbox covering an existing text block should not add a duplicate.
+    pages = [_simple_page()]
+    layout = [[{"category": "Picture", "bbox": [690, 190, 960, 250]}]]
+
+    fused = layout_fusion.enhance_layout_with_dotocr(pages, layout)
+    pictures = [w for w in fused[0]["text"] if w.get("block_type") == "picture"]
+    assert not pictures
+
+
+def test_phase3_picture_inserted_in_reading_order():
+    # Heading (top, y=50), picture (y=110-180), paragraph (y=200) -> the picture
+    # must land between the heading and the paragraph.
+    pages = [_simple_page()]
+    layout = [[
+        {"category": "Title", "bbox": [290, 40, 500, 100], "text": "x"},
+        {"category": "Picture", "bbox": [100, 110, 900, 180]},
+    ]]
+
+    fused = layout_fusion.enhance_layout_with_dotocr(pages, layout)
+    block_types = [w["block_type"] for w in fused[0]["text"]]
+    pic_index = block_types.index("picture")
+    heading_index = block_types.index("heading")
+    text_index = block_types.index("text")
+    assert heading_index < pic_index < text_index
+
+
+def test_phase3_picture_can_be_disabled():
+    pages = [_simple_page()]
+    layout = [[{"category": "Picture", "bbox": [100, 900, 900, 1200]}]]
+    fused = layout_fusion.enhance_layout_with_dotocr(pages, layout, enable_pictures=False)
+    assert not [w for w in fused[0]["text"] if w.get("block_type") == "picture"]
 
 
 def test_run_fusion_ocr_degrades_when_dotocr_unavailable(monkeypatch):
