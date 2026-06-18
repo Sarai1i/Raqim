@@ -1,8 +1,19 @@
-# dots.mocr proof-of-concept dependencies (branch-scoped).
+# dots.mocr (DotOCR) dependencies — branch-scoped.
 #
-# These requirements are intentionally kept SEPARATE from the main
-# requirements.txt so the existing DeepSeek-OCR-2 pipeline is untouched.
-# Install them into an isolated environment, e.g.:
+# Used by both the standalone PoC (test_dots_ocr.py) and the in-app DotOCR
+# layout engine (dots_ocr_engine.py, enabled via OCR_ENGINE=dots).
+#
+# These are kept SEPARATE from the main requirements.txt because the two OCR
+# engines need DIFFERENT, mutually-exclusive transformers versions:
+#   * DeepSeek-OCR-2 (default) -> transformers==4.46.3 (requirements.txt)
+#   * DotOCR / dots.mocr       -> transformers==4.57.6 (this file)
+# Only one engine can be installed in a given environment at a time.
+#
+# For the in-app DotOCR engine you also need the base app deps (Flask,
+# pdf2image, python-docx, Pillow ...) from requirements.txt, but with
+# transformers pinned to 4.57.6 (install requirements.txt first, then this file).
+#
+# Standalone PoC install into an isolated environment, e.g.:
 #
 #   cd Raqim/Backend
 #   python3 -m venv venv-dots
