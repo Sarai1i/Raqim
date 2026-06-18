@@ -12,3 +12,4 @@ Raqim/Backend/deepseek_evaluation.xlsx
 Raqim/my-app/node_modules/
 *.pyc
 *.log
+node_modules/
