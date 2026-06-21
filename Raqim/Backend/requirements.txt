@@ -23,6 +23,9 @@ torch==2.6.0
 # API Requests
 requests==2.31.0
  
+# Remote DeepSeek OCR over Gradio (used when OCR_PROVIDER=gradio_deepseek)
+gradio_client
+ 
 # Environment Variables
 python-dotenv==1.0.0
  

@@ -48,7 +48,16 @@ DEEPSEEK_APPROX_CONFIDENCE = float(os.getenv("DEEPSEEK_APPROX_CONFIDENCE", "95")
 # DeepSeek grounding coordinates are normalized to this scale (0..N).
 DEEPSEEK_COORD_SCALE = float(os.getenv("DEEPSEEK_COORD_SCALE", "1000.0"))
 
+# OCR provider selector. Default "local" keeps the local GPU DeepSeek path intact.
+# Set OCR_PROVIDER=gradio_deepseek to call a remote DeepSeek over Gradio instead
+# (no _load_deepseek_ocr, no .cuda()).
+OCR_PROVIDER = os.getenv("OCR_PROVIDER", "local").strip().lower()
+# Remote DeepSeek-over-Gradio settings (used only when OCR_PROVIDER=gradio_deepseek).
+GRADIO_DEEPSEEK_URL = os.getenv("GRADIO_DEEPSEEK_URL", "")
+GRADIO_DEEPSEEK_API_NAME = os.getenv("GRADIO_DEEPSEEK_API_NAME", "/ocr_image")
+
 _DEEPSEEK_OCR = None
+_GRADIO_DEEPSEEK_CLIENT = None
 
 
 def configure_tesseract(tesseract_cmd: str | None = None) -> None:
@@ -188,6 +197,47 @@ def _deepseek_ocr_raw(image: Image.Image) -> str:
                 return _trim(candidate)
         # No grounding available; fall back to the cleaned saved result.
         return _trim(_read_deepseek_result(out_dir, res))
+
+
+def _get_gradio_deepseek_client():
+    """Lazily create a single gradio_client.Client for the remote DeepSeek space."""
+    global _GRADIO_DEEPSEEK_CLIENT
+    if not GRADIO_DEEPSEEK_URL:
+        raise RuntimeError(
+            "OCR_PROVIDER=gradio_deepseek لكن GRADIO_DEEPSEEK_URL غير مضبوط في .env"
+        )
+    if _GRADIO_DEEPSEEK_CLIENT is None:
+        from gradio_client import Client
+        _GRADIO_DEEPSEEK_CLIENT = Client(GRADIO_DEEPSEEK_URL)
+    return _GRADIO_DEEPSEEK_CLIENT
+
+
+def _gradio_deepseek_raw(image: Image.Image) -> str:
+    """Send a page image to the remote DeepSeek (Gradio) and return its RAW output.
+
+    The returned text keeps the original ``<|ref|>``/``<|det|>`` grounding tags so it
+    can be passed unchanged to ``_build_words_with_real_boxes`` (coordinates preserved).
+    No local model is loaded and no GPU (.cuda()) is used in this path.
+    """
+    try:
+        from gradio_client import handle_file as _gradio_file
+    except Exception:
+        # Older gradio_client versions expose ``file`` instead of ``handle_file``.
+        from gradio_client import file as _gradio_file
+
+    client = _get_gradio_deepseek_client()
+    with tempfile.TemporaryDirectory() as work_dir:
+        image_path = os.path.join(work_dir, "input.png")
+        image.convert("RGB").save(image_path)
+        try:
+            result = client.predict(_gradio_file(image_path), api_name=GRADIO_DEEPSEEK_API_NAME)
+        except Exception as exc:
+            raise RuntimeError(f"تعذر استدعاء DeepSeek عبر Gradio: {exc}") from exc
+
+    # Some endpoints return a tuple/list of outputs; take the first textual one.
+    if isinstance(result, (list, tuple)):
+        result = result[0] if result else ""
+    return result if isinstance(result, str) else str(result)
 
 
 # DeepSeek emits grounding coordinates on a normalized 0..1000 grid.
@@ -696,7 +746,12 @@ def _ocr_page(image: Image.Image) -> tuple[List[Dict], Dict]:
 
     width, height = image.size
 
-    raw = _deepseek_ocr_raw(image)
+    # اختيار المزود: عند gradio_deepseek نرسل الصورة لخدمة Gradio بعيدة ونستلم
+    # الناتج الخام كما هو؛ وإلا نُبقي المسار المحلي (GPU) دون تغيير.
+    if OCR_PROVIDER == "gradio_deepseek":
+        raw = _gradio_deepseek_raw(image)
+    else:
+        raw = _deepseek_ocr_raw(image)
     words = _build_words_with_real_boxes(raw, width, height)
 
     if not words:
