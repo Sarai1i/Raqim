@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import tempfile
 from pathlib import Path
 from typing import Dict, List
@@ -238,6 +239,29 @@ def _gradio_deepseek_raw(image: Image.Image) -> str:
     if isinstance(result, (list, tuple)):
         result = result[0] if result else ""
     return result if isinstance(result, str) else str(result)
+
+
+def _coerce_gradio_pages(parsed, local_image_path: str):
+    """Normalize a parsed Gradio JSON payload into a Raqim pages list.
+
+    The remote may return a ready Raqim result: a list (or single dict) of pages,
+    each having ``page_number`` and ``text``. We accept it as-is and only rewrite
+    ``image_path`` to point to the locally saved page image. Returns the pages
+    list, or ``None`` if the payload is not in the expected Raqim page format.
+    """
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list) or not parsed:
+        return None
+
+    pages_out = []
+    for page in parsed:
+        if not isinstance(page, dict) or "page_number" not in page or "text" not in page:
+            return None
+        page = dict(page)
+        page["image_path"] = local_image_path
+        pages_out.append(page)
+    return pages_out
 
 
 # DeepSeek emits grounding coordinates on a normalized 0..1000 grid.
@@ -746,12 +770,7 @@ def _ocr_page(image: Image.Image) -> tuple[List[Dict], Dict]:
 
     width, height = image.size
 
-    # اختيار المزود: عند gradio_deepseek نرسل الصورة لخدمة Gradio بعيدة ونستلم
-    # الناتج الخام كما هو؛ وإلا نُبقي المسار المحلي (GPU) دون تغيير.
-    if OCR_PROVIDER == "gradio_deepseek":
-        raw = _gradio_deepseek_raw(image)
-    else:
-        raw = _deepseek_ocr_raw(image)
+    raw = _deepseek_ocr_raw(image)
     words = _build_words_with_real_boxes(raw, width, height)
 
     if not words:
@@ -783,6 +802,37 @@ def ocr_with_highlighting(file_path: str | os.PathLike[str], output_folder: str 
     for page_number, image in enumerate(pages, start=1):
         preview_path = output_dir / f"original_page_{page_number}.png"
         image.save(preview_path, format="PNG")
+
+        if OCR_PROVIDER == "gradio_deepseek":
+            gradio_raw = _gradio_deepseek_raw(image)
+            stripped = gradio_raw.strip() if isinstance(gradio_raw, str) else ""
+            # (1) ناتج JSON جاهز بصيغة Raqim: نعيده مباشرة بعد ضبط image_path
+            #     إلى صورة الصفحة المحلية، دون تمريره إلى _build_words_with_real_boxes.
+            if stripped[:1] in ("[", "{"):
+                try:
+                    parsed = json.loads(stripped)
+                except (ValueError, TypeError):
+                    parsed = None
+                page_dicts = _coerce_gradio_pages(parsed, str(preview_path)) if parsed is not None else None
+                if page_dicts is not None:
+                    results.extend(page_dicts)
+                    continue
+            # (2) ليس JSON متوقعًا: نعامله كـ raw DeepSeek output ونبني الكلمات منه.
+            page_words = _build_words_with_real_boxes(gradio_raw, image.width, image.height)
+            results.append(
+                {
+                    "page_number": page_number,
+                    "image_path": str(preview_path),
+                    "text": page_words,
+                    "ocr_engine": "deepseek",
+                    "ocr_engine_label": f"DeepSeek-OCR-2 (gradio, {DEEPSEEK_OCR_MODEL_NAME})",
+                    "ocr_provider": "gradio_deepseek",
+                    "qari_attempted": False,
+                    "fallback_used": False,
+                    "fallback_reason": "",
+                }
+            )
+            continue
 
         page_words, engine_info = _ocr_page(image)
         results.append(
