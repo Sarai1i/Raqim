@@ -7,8 +7,7 @@ import shutil
 import threading
 from io import BytesIO
 from werkzeug.security import generate_password_hash, check_password_hash
-from ocr_model import DeepSeekOCRError, ocr_with_highlighting
-from post_processor import post_processor
+from ocr_model import configure_tesseract, ocr_with_highlighting
 from flask_cors import CORS
 import requests
 import google.generativeai as genai
@@ -126,8 +125,47 @@ def _get_arabic_checker_client():
 
 
 def get_arabic_checker_suggestions(word, max_suggestions=5):
-    """تم تعطيل الاقتراحات الذكية برمجياً بناءً على طلب المستخدم."""
+    """الاقتراحات معطّلة: رقيم يعمل باستخراج DeepSeek فقط دون اقتراحات LLM."""
     return []
+
+
+def _unused_get_arabic_checker_suggestions(word, max_suggestions=5):
+    """استدعاء المدقق العربي (أداة Gradio) وإرجاع اقتراحات تصحيح للكلمة.
+
+    شكل الإخراج من الأداة: نص JSON فيه "corrections"، كل عنصر يحوي
+    "incorrect_token" و"suggested_corrections" (قائمة قوائم) و"explanation".
+    نرجع قائمة عناصر بالشكل {word, source, reason} لتتوافق مع واجهة المراجعة.
+    """
+    original_word = (word or "").strip()
+    if not original_word or not ARABIC_CHECKER_ENABLED:
+        return []
+
+    try:
+        client = _get_arabic_checker_client()
+        raw = client.predict(sent=original_word, api_name=ARABIC_CHECKER_API_NAME)
+        data = raw if isinstance(raw, dict) else json.loads(raw)
+    except Exception as e:
+        print(f"❌ خطأ في المدقق العربي (Gradio): {e}")
+        return []
+
+    items = []
+    for correction in (data.get("corrections", []) if isinstance(data, dict) else []):
+        explanations = correction.get("explanation") or []
+        reason = explanations[0] if isinstance(explanations, list) and explanations else "اقتراح من المدقق العربي"
+        for group in correction.get("suggested_corrections", []) or []:
+            candidates = group if isinstance(group, list) else [group]
+            for candidate in candidates:
+                candidate = (str(candidate) if candidate is not None else "").strip()
+                if candidate and candidate != original_word:
+                    items.append({"word": candidate, "source": "arabic_checker", "reason": str(reason)[:120]})
+
+    # إزالة التكرار مع الحفاظ على الترتيب
+    deduped, seen = [], set()
+    for item in items:
+        if item["word"] not in seen:
+            seen.add(item["word"])
+            deduped.append(item)
+    return deduped[:max_suggestions]
 
 
 # ============================================================================
@@ -139,11 +177,55 @@ GEMINI_ENABLED = bool(API_KEY)
 
 
 def get_gemini_suggestions(word, context="", max_suggestions=5):
-    """تم تعطيل الاقتراحات الذكية برمجياً بناءً على طلب المستخدم."""
+    """الاقتراحات معطّلة: رقيم يعمل باستخراج DeepSeek فقط دون اقتراحات LLM."""
     return []
 
 
+def _unused_get_gemini_suggestions(word, context="", max_suggestions=5):
+    """اقتراحات تصحيح إملائي للكلمة العربية عبر Gemini.
+
+    يرسل الكلمة (مع سياقها إن وُجد) ويطلب بدائل مصحّحة فقط. يُرجع عناصر بالشكل
+    {word, source, reason}. يفشل بهدوء (يرجع []) عند غياب المفتاح أو أي خطأ.
+    """
+    word = (word or "").strip()
+    if not word or not GEMINI_ENABLED or model is None:
+        return []
+
+    context_line = f"\nالسياق: {context.strip()}" if context and context.strip() else ""
+    prompt = (
+        "أنت مدقق إملائي للعربية. صحّح الكلمة التالية إن كان بها خطأ إملائي ناتج "
+        "عن التعرّف الضوئي (OCR). أعد فقط البدائل الصحيحة المحتملة، الأكثر ترجيحًا "
+        "أولًا، مفصولة بفواصل، دون أي شرح أو جُمل. إن كانت الكلمة صحيحة فأعد الكلمة "
+        f"نفسها فقط.\nالكلمة: {word}{context_line}"
+    )
+
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.2, max_output_tokens=60
+            ),
+        )
+        text = (response.text or "").strip()
+    except Exception as e:
+        print(f"❌ خطأ في Gemini: {e}")
+        return []
+
+    candidates = re.split(r"[,،\n]+", text)
+    items, seen = [], set()
+    for cand in candidates:
+        cand = cand.strip().strip(".").strip()
+        if cand and cand != word and cand not in seen:
+            seen.add(cand)
+            items.append({"word": cand, "source": "gemini", "reason": "اقتراح من Gemini"})
+    return items[:max_suggestions]
+
+
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key")
+
+# تكوين Tesseract
+TESSERACT_PATH = os.getenv("TESSERACT_CMD") or shutil.which("tesseract") or "tesseract"
+configure_tesseract(TESSERACT_PATH)
 
 # متغيرات المعالجة
 processing_complete = False
@@ -154,7 +236,10 @@ original_file_name = ""
 ocr_engine_status = {
     "engine": "pending",
     "label": "بانتظار المعالجة",
-    "provider": "deepseek_local",
+    "provider": "pending",
+    "qari_attempted": False,
+    "fallback_used": False,
+    "fallback_reason": "",
 }
 
 # مجلدات التخزين
@@ -642,8 +727,86 @@ def get_allam_correction_suggestions(word, context="", page_number=None, max_sug
 
 
 def get_llm_correction_suggestions(word, context="", confidence=None, max_suggestions=4):
-    """تم تعطيل الاقتراحات الذكية برمجياً بناءً على طلب المستخدم."""
-    return []
+    """إرجاع اقتراحات LLM لكلمة OCR واحدة دون تطبيقها تلقائيًا."""
+    original_word = (word or "").strip()
+    if not original_word:
+        return []
+
+    if not LLM_SUGGESTIONS_ENABLED or not LLM_SUGGESTIONS_API_BASE_URL or not LLM_SUGGESTIONS_API_KEY:
+        return []
+
+    context = (context or "").strip()
+    confidence_text = "غير متاح" if confidence is None else str(confidence)
+
+    system_prompt = (
+        "أنت مساعد متخصص في مراجعة كلمات OCR العربية والإنجليزية. "
+        "أعد اقتراحات تصحيح قصيرة فقط للكلمة المحددة، ولا تغيّر المعنى، ولا تشرح خارج JSON. "
+        "إذا كانت الكلمة صحيحة أو غير مؤكدة، أعد قائمة فارغة."
+    )
+    user_prompt = f"""راجع الكلمة المحددة المستخرجة من OCR واقترح بدائل تصحيح محتملة فقط إذا كان هناك خطأ واضح.
+
+القواعد:
+- أعد JSON صالحًا فقط بالشكل: {{"suggestions":[{{"word":"...","reason":"..."}}]}}
+- اجعل عدد الاقتراحات من 0 إلى {max_suggestions}.
+- الاقتراح يجب أن يكون كلمة واحدة أو عبارة قصيرة جدًا، عربيًا أو إنجليزيًا حسب السياق.
+- لا تطبق التصحيح، ولا تعد النص كاملًا، ولا تضف شرحًا خارج JSON.
+
+الكلمة: {original_word}
+ثقة OCR: {confidence_text}
+السياق القريب: {context}
+"""
+
+    payload = {
+        "model": LLM_SUGGESTIONS_MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 700,
+        "reasoning": {"effort": "minimal"},
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        response = requests.post(
+            f"{LLM_SUGGESTIONS_API_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {LLM_SUGGESTIONS_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=LLM_SUGGESTIONS_TIMEOUT_SECONDS,
+        )
+
+        # بعض النماذج أو البروكسيات قد لا تدعم response_format؛ نعيد المحاولة بدونها بدل تعطيل الميزة.
+        if response.status_code in {400, 422}:
+            payload.pop("response_format", None)
+            response = requests.post(
+                f"{LLM_SUGGESTIONS_API_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {LLM_SUGGESTIONS_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=LLM_SUGGESTIONS_TIMEOUT_SECONDS,
+            )
+
+        response.raise_for_status()
+        data = response.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        parsed = _parse_json_safely(content)
+        raw_suggestions = parsed.get("suggestions", [])
+        if isinstance(raw_suggestions, str):
+            raw_suggestions = [raw_suggestions]
+        if not isinstance(raw_suggestions, list):
+            raw_suggestions = []
+
+        items = [_normalise_suggestion_item(item, original_word, source="llm") for item in raw_suggestions]
+        return _dedupe_suggestion_items(items)[:max_suggestions]
+    except Exception as e:
+        print(f"❌ خطأ في اقتراحات LLM: {e}")
+        return []
 
 
 def _extract_ocr_plain_text():
@@ -998,8 +1161,11 @@ def upload_file():
     ocr_results = []
     ocr_engine_status = {
         "engine": "pending",
-        "label": "جاري تحميل DeepSeek-OCR-2",
-        "provider": "deepseek_local",
+        "label": "جاري تحديد المحرك",
+        "provider": "pending",
+        "qari_attempted": False,
+        "fallback_used": False,
+        "fallback_reason": "",
     }
 
     if "file" not in request.files:
@@ -1034,19 +1200,48 @@ def upload_file():
 
 
 def _summarize_ocr_engine(pages):
-    """تلخيص محرك DeepSeek-OCR-2 المستخدم في آخر معالجة."""
+    """تلخيص المحرك المستخدم في آخر معالجة حتى يظهر بوضوح في الواجهة."""
     if not pages:
         return {
             "engine": "unknown",
             "label": "غير معروف",
-            "provider": "deepseek_local",
+            "provider": "unknown",
+            "qari_attempted": False,
+            "fallback_used": False,
+            "fallback_reason": "",
         }
 
+    fallback_page = next((page for page in pages if page.get("fallback_used")), None)
+    qari_page = next((page for page in pages if page.get("ocr_engine") == "qari"), None)
     first_page = pages[0]
+
+    if fallback_page:
+        return {
+            "engine": "tesseract",
+            "label": "Tesseract fallback",
+            "provider": "tesseract",
+            "qari_attempted": bool(fallback_page.get("qari_attempted")),
+            "fallback_used": True,
+            "fallback_reason": fallback_page.get("fallback_reason", ""),
+        }
+
+    if qari_page:
+        return {
+            "engine": "qari",
+            "label": "Qari OCR",
+            "provider": qari_page.get("ocr_provider", "space"),
+            "qari_attempted": True,
+            "fallback_used": False,
+            "fallback_reason": "",
+        }
+
     return {
-        "engine": first_page.get("ocr_engine", "deepseek"),
-        "label": first_page.get("ocr_engine_label", "DeepSeek-OCR-2"),
-        "provider": first_page.get("ocr_provider", "deepseek_local"),
+        "engine": first_page.get("ocr_engine", "unknown"),
+        "label": first_page.get("ocr_engine_label", "غير معروف"),
+        "provider": first_page.get("ocr_provider", "unknown"),
+        "qari_attempted": bool(first_page.get("qari_attempted")),
+        "fallback_used": bool(first_page.get("fallback_used")),
+        "fallback_reason": first_page.get("fallback_reason", ""),
     }
 
 
@@ -1066,36 +1261,25 @@ def process_ocr(file_entry):
 
     print(f"📂 تحميل الملف من GridFS: {file_entry['filename']}")
 
-    # تشغيل DeepSeek-OCR-2 وتحديث `ocr_results`.
+    # تشغيل OCR وتحديث `ocr_results`. إذا تعذر Qari لا نعرض Tesseract fallback كنجاح عادي.
     try:
         ocr_results = ocr_with_highlighting(temp_file_path, UPLOAD_FOLDER)
         ocr_engine_status = _summarize_ocr_engine(ocr_results)
-        print(f"🔎 OCR engine used: {ocr_engine_status['label']} (provider={ocr_engine_status['provider']})")
-    except DeepSeekOCRError as ocr_error:
-        processing_complete = False
-        processing_failed = True
-        processing_error = str(ocr_error)
-        ocr_results = []
-        ocr_engine_status = {
-            "engine": "deepseek_error",
-            "label": "تعذر تشغيل DeepSeek-OCR-2",
-            "provider": "deepseek_local",
-            "error": str(ocr_error),
-        }
-        print(f"❌ تعذر تشغيل DeepSeek-OCR-2: {ocr_error}")
-        return
+        print(f"🔎 OCR engine used: {ocr_engine_status['label']} (provider={ocr_engine_status['provider']}, fallback={ocr_engine_status['fallback_used']})")
     except Exception as ocr_error:
         processing_complete = False
         processing_failed = True
         processing_error = str(ocr_error)
         ocr_results = []
         ocr_engine_status = {
-            "engine": "deepseek_error",
-            "label": "تعذر تشغيل DeepSeek-OCR-2",
-            "provider": "deepseek_local",
-            "error": str(ocr_error),
+            "engine": "tesseract_error",
+            "label": "تعذر تشغيل Tesseract OCR",
+            "provider": "tesseract",
+            "language": "ara+eng",
+            "fallback_used": False,
+            "fallback_reason": str(ocr_error),
         }
-        print(f"❌ تعذر تشغيل DeepSeek-OCR-2: {ocr_error}")
+        print(f"❌ تعذر تشغيل Tesseract OCR على ملف المستخدم باللغتين العربية والإنجليزية: {ocr_error}")
         return
 
     # ✅ **تأكد من عدم احتواء `ocr_results` على بيانات غير صحيحة**
@@ -1103,11 +1287,8 @@ def process_ocr(file_entry):
         print("❌ خطأ: لم يتم استخراج أي نصوص صحيحة!")
         return
 
-    # 🔹 تطبيق المعالجة اللاحقة لتحسين التنسيق برمجياً
-    ocr_text_raw = "\n".join([" ".join([word["word"] for word in page["text"]]) for page in ocr_results])
-    ocr_text = post_processor.process_text(ocr_text_raw)
-    
     # 🔹 تحديث قاعدة البيانات وربط نتائج OCR بالملف الأصلي
+    ocr_text = "\n".join([" ".join([word["word"] for word in page["text"]]) for page in ocr_results])
     ocr_file_id = fs.put(ocr_text.encode("utf-8"), filename=f"ocr_{file_entry['filename']}.txt")
 
     files_collection.update_one(
@@ -1127,10 +1308,10 @@ def review_page():
     if processing_failed:
         return jsonify({
             "status": "failed",
-            "error": processing_error or "تعذر تشغيل DeepSeek-OCR-2 على الملف الحالي.",
+            "error": "تعذر تشغيل Tesseract OCR على الملف الحالي باللغتين العربية والإنجليزية.",
             "details": processing_error,
             "ocr_engine": ocr_engine_status,
-        }), 200
+        }), 503
 
     if not processing_complete:
         return jsonify({"status": "processing"}), 202  # ✅ تحديث الاستجابة في حالة المعالجة
@@ -1441,10 +1622,10 @@ def processing_status():
         if processing_failed:
             return jsonify({
                 "status": "failed",
-                "error": processing_error or "تعذر تشغيل DeepSeek-OCR-2 على الملف الحالي.",
+                "error": "تعذر تشغيل Tesseract OCR على الملف الحالي باللغتين العربية والإنجليزية.",
                 "details": processing_error,
                 "ocr_engine": ocr_engine_status,
-            }), 200
+            }), 503
         return jsonify({"status": "done" if processing_complete else "processing", "ocr_engine": ocr_engine_status})
     except NameError:
         return jsonify({"status": "processing"})  # ✅ تأمين الحالة الافتراضية
@@ -1580,6 +1761,68 @@ def _set_rtl_paragraph(paragraph):
     pPr = paragraph._p.get_or_add_pPr()
     bidi = OxmlElement("w:bidi")
     pPr.append(bidi)
+
+
+# ============================================================================
+# معالجة أسطر الفهرس (Table of Contents) — إضافة نقاط منقّطة (dotted leaders).
+# الهدف: تحويل سطر مثل "المقدمة 5" إلى:  المقدمة .......... 5
+# دون لمس بقية المعالجة (الجداول/المعادلات/الفقرات تبقى كما هي).
+# ============================================================================
+def _parse_toc_line(text, in_toc=False):
+    """يكتشف سطر فهرس: عنوان (+ رقم صفحة اختياري).
+
+    يعيد (العنوان, رقم_الصفحة_أو_فراغ) إن بدا السطر مدخل فهرس، وإلا None.
+    عندما نكون داخل قسم فهرس (``in_toc=True``) نتساهل ونقبل العناوين بلا أرقام
+    أيضًا (تظهر بنقاط منقّطة فقط)، لأن كثيرًا من الفهارس العربية بلا أرقام صفحات.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    # حالة: عنوان + رقم صفحة في النهاية.
+    m = re.match(r"^(.*?)[\s.\u00b7…\-]*([\d\u0660-\u0669]+)$", raw)
+    if m:
+        title = m.group(1).strip(" .\u00b7…-\t")
+        page = m.group(2).strip()
+        if title and len(title) >= 2:
+            has_dot_leader = bool(re.search(r"[.\u00b7…]{2,}|\s{2,}", raw))
+            if has_dot_leader or in_toc or len(raw.split()) <= 8:
+                return title, page
+
+    # حالة: داخل قسم فهرس وبلا رقم صفحة — نقبله كعنوان منقّط بلا رقم.
+    if in_toc:
+        title = raw.strip(" .\u00b7…-\t")
+        # نتفادى الأسطر الطويلة جدًا (فقرات نصية) داخل الفهرس.
+        if title and 2 <= len(title) and len(raw.split()) <= 14:
+            return title, ""
+
+    return None
+
+
+def _is_toc_heading(text):
+    """هل هذا العنوان يبدأ قسم فهرس؟ (الفهرس/المحتويات/قائمة المحتويات)."""
+    t = (text or "").strip()
+    return bool(re.match(r"^(ال)?(فهرس|محتويات|قائمة المحتويات|المحتويات)\b", t))
+
+
+def _add_toc_paragraph(document, title, page):
+    """يضيف فقرة فهرس بنقاط منقّطة بين العنوان ورقم الصفحة، باتجاه RTL.
+
+    إن لم يوجد رقم صفحة (page فارغ) نضيف النقاط المنقّطة حتى الحافة فقط.
+    """
+    from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER, WD_ALIGN_PARAGRAPH
+    from docx.shared import Cm
+
+    p = document.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    _set_rtl_paragraph(p)
+    tab_stops = p.paragraph_format.tab_stops
+    tab_stops.add_tab_stop(Cm(15), WD_TAB_ALIGNMENT.LEFT, WD_TAB_LEADER.DOTS)
+    run = p.add_run(title)
+    run.font.name = "Arial"
+    run_page = p.add_run("\t" + (str(page) if page else ""))
+    run_page.font.name = "Arial"
+    return p
 
 
 def _fix_omml_bugs(omml):
@@ -1970,5 +2213,7 @@ def login_api():
 if __name__ == "__main__":
     flask_host = os.getenv("FLASK_HOST", "0.0.0.0")
     flask_port = int(os.getenv("FLASK_PORT", "5000"))
-    flask_debug = os.getenv("FLASK_DEBUG", "true").lower() in {"1", "true", "yes", "on"}
-    app.run(host=flask_host, port=flask_port, debug=flask_debug)
+    # debug=false افتراضيًا: مُراقب الملفات (watchdog) كان يعيد التشغيل أثناء
+    # معالجة DeepSeek (عند تحميل torch) فيكسر العملية. أبقه مطفأ للاستخراج الثابت.
+    flask_debug = os.getenv("FLASK_DEBUG", "false").lower() in {"1", "true", "yes", "on"}
+    app.run(host=flask_host, port=flask_port, debug=flask_debug, use_reloader=flask_debug)
