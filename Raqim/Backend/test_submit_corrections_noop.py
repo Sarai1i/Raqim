@@ -5,6 +5,10 @@ ocr_stub = types.ModuleType("ocr_model")
 ocr_stub.configure_tesseract = lambda *_args, **_kwargs: None
 ocr_stub.ocr_with_highlighting = lambda *_args, **_kwargs: []
 ocr_stub.DeepSeekOCRError = RuntimeError
+ocr_stub.KawnOCRError = RuntimeError
+ocr_stub.get_active_ocr_provider = lambda: "deepseek"
+ocr_stub.get_pending_ocr_label = lambda: "بانتظار المعالجة"
+ocr_stub.get_ocr_failure_label = lambda: "تعذر تشغيل DeepSeek-OCR-2"
 sys.modules["ocr_model"] = ocr_stub
 
 try:

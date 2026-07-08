@@ -12,6 +12,22 @@ class _FakeDeepSeekOCRError(RuntimeError):
     pass
 
 
+class _FakeKawnOCRError(RuntimeError):
+    pass
+
+
+def _fake_get_active_ocr_provider():
+    return "deepseek"
+
+
+def _fake_get_pending_ocr_label():
+    return "بانتظار المعالجة"
+
+
+def _fake_get_ocr_failure_label():
+    return "تعذر تشغيل DeepSeek-OCR-2"
+
+
 def _fake_ocr_success(_file_path, _output_folder):
     return [
         {
@@ -46,6 +62,10 @@ def _fake_ocr_success(_file_path, _output_folder):
 
 ocr_stub.ocr_with_highlighting = _fake_ocr_success
 ocr_stub.DeepSeekOCRError = _FakeDeepSeekOCRError
+ocr_stub.KawnOCRError = _FakeKawnOCRError
+ocr_stub.get_active_ocr_provider = _fake_get_active_ocr_provider
+ocr_stub.get_pending_ocr_label = _fake_get_pending_ocr_label
+ocr_stub.get_ocr_failure_label = _fake_get_ocr_failure_label
 sys.modules["ocr_model"] = ocr_stub
 
 try:
