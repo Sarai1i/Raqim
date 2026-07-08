@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="لوحة السحب العشوائي - نظام السحب الاحترافي" />
+  <title>لوحة السحب العشوائي</title>
+
+  <!-- Google Font: Tajawal -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@300;400;500;700;800;900&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body class="light-mode" id="appBody">
+
+  <!-- ══════════════════════════════════════════════════════
+       SIDE PANEL — Edit Lists
+  ══════════════════════════════════════════════════════ -->
+  <div class="panel-overlay" id="panelOverlay" aria-hidden="true"></div>
+
+  <aside class="side-panel" id="sidePanel" role="complementary" aria-label="تعديل القوائم">
+    <div class="panel-header">
+      <h2 class="panel-title">تعديل القوائم</h2>
+      <button class="panel-close-btn" id="closePanelBtn" aria-label="إغلاق اللوحة">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="panel-body">
+      <!-- People list editor -->
+      <div class="panel-section">
+        <label class="panel-label" for="peopleEditor">
+          قائمة الأشخاص
+          <span class="panel-count" id="peopleCount">0</span>
+        </label>
+        <textarea
+          id="peopleEditor"
+          class="panel-textarea"
+          placeholder="أدخل اسماً في كل سطر..."
+          aria-label="تعديل قائمة الأشخاص"
+          rows="10"
+        ></textarea>
+      </div>
+
+      <!-- Games list editor -->
+      <div class="panel-section">
+        <label class="panel-label" for="gamesEditor">
+          قائمة الألعاب
+          <span class="panel-count" id="gamesCount">0</span>
+        </label>
+        <textarea
+          id="gamesEditor"
+          class="panel-textarea"
+          placeholder="أدخل اسم لعبة في كل سطر..."
+          aria-label="تعديل قائمة الألعاب"
+          rows="10"
+        ></textarea>
+      </div>
+
+      <!-- Panel actions -->
+      <div class="panel-actions">
+        <button class="btn btn-primary btn-full" id="savePanelBtn">حفظ التغييرات</button>
+        <button class="btn btn-ghost btn-full" id="resetListsBtn">إعادة تعيين القوائم</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ══════════════════════════════════════════════════════
+       MAIN APP WRAPPER
+  ══════════════════════════════════════════════════════ -->
+  <div class="app-wrapper" id="appWrapper">
+
+    <!-- ── Top Toolbar ─────────────────────────────────── -->
+    <header class="toolbar" role="banner">
+      <div class="toolbar-start">
+        <button class="toolbar-btn" id="editListsBtn" aria-label="تعديل القوائم" title="تعديل القوائم">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+          <span>تعديل القوائم</span>
+        </button>
+      </div>
+
+      <div class="toolbar-end">
+        <!-- Sound toggle -->
+        <button class="toolbar-icon-btn" id="soundBtn" aria-label="تبديل الصوت" title="الصوت">
+          <svg id="soundOnIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+            <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+          </svg>
+          <svg id="soundOffIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>
+          </svg>
+        </button>
+
+        <!-- Dark mode toggle -->
+        <button class="toolbar-icon-btn" id="darkModeBtn" aria-label="تبديل الوضع الليلي" title="الوضع الليلي">
+          <svg id="moonIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+          <svg id="sunIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+            <circle cx="12" cy="12" r="5"/>
+            <line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+            <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+          </svg>
+        </button>
+
+        <!-- Fullscreen -->
+        <button class="toolbar-icon-btn" id="fullscreenBtn" aria-label="ملء الشاشة" title="ملء الشاشة">
+          <svg id="fullscreenEnterIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+          </svg>
+          <svg id="fullscreenExitIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+            <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 0 2-2h3M3 16h3a2 2 0 0 0 2 2v3"/>
+          </svg>
+        </button>
+
+        <!-- Export CSV -->
+        <button class="toolbar-icon-btn" id="exportBtn" aria-label="تصدير النتائج" title="تصدير CSV">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- ── Hero Title ───────────────────────────────────── -->
+    <section class="hero" aria-labelledby="heroTitle">
+      <h1 class="hero-title" id="heroTitle">لوحة السحب العشوائي</h1>
+      <p class="hero-subtitle">نظام السحب الاحترافي</p>
+    </section>
+
+    <!-- ── Main Content ─────────────────────────────────── -->
+    <main class="main-content" role="main">
+
+      <!-- Wheels Row -->
+      <div class="wheels-row">
+
+        <!-- People Wheel -->
+        <div class="wheel-card" id="peopleWheelCard">
+          <div class="wheel-card-header">
+            <h2 class="wheel-card-title">الأشخاص</h2>
+            <span class="wheel-remaining-badge" id="peopleRemaining">14</span>
+          </div>
+          <div class="wheel-container">
+            <div class="wheel-pointer" aria-hidden="true">
+              <svg viewBox="0 0 40 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M20 48 L0 8 Q20 0 40 8 Z" fill="#006C35"/>
+                <circle cx="20" cy="10" r="6" fill="white" opacity="0.9"/>
+              </svg>
+            </div>
+            <canvas id="peopleCanvas" class="wheel-canvas" aria-label="عجلة الأشخاص" role="img"></canvas>
+            <div class="wheel-center-cap" id="peopleCenterCap" aria-hidden="true">
+              <div class="wheel-center-inner"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Games Wheel -->
+        <div class="wheel-card" id="gamesWheelCard">
+          <div class="wheel-card-header">
+            <h2 class="wheel-card-title">الألعاب</h2>
+            <span class="wheel-remaining-badge" id="gamesRemaining">14</span>
+          </div>
+          <div class="wheel-container">
+            <div class="wheel-pointer" aria-hidden="true">
+              <svg viewBox="0 0 40 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M20 48 L0 8 Q20 0 40 8 Z" fill="#006C35"/>
+                <circle cx="20" cy="10" r="6" fill="white" opacity="0.9"/>
+              </svg>
+            </div>
+            <canvas id="gamesCanvas" class="wheel-canvas" aria-label="عجلة الألعاب" role="img"></canvas>
+            <div class="wheel-center-cap" id="gamesCenterCap" aria-hidden="true">
+              <div class="wheel-center-inner"></div>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /wheels-row -->
+
+      <!-- Draw Button -->
+      <div class="draw-btn-row">
+        <button class="btn btn-draw" id="drawBtn" aria-label="بدء السحب">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          <span id="drawBtnText">بدء السحب</span>
+        </button>
+        <button class="btn btn-ghost btn-reset" id="resetDrawBtn" aria-label="إعادة السحب" title="إعادة السحب">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="1 4 1 10 7 10"/>
+            <path d="M3.51 15a9 9 0 1 0 .49-4.95"/>
+          </svg>
+          <span>إعادة السحب</span>
+        </button>
+      </div>
+
+      <!-- End of Draw Banner (hidden by default) -->
+      <div class="end-banner" id="endBanner" role="alert" aria-live="polite" hidden>
+        <div class="end-banner-icon" aria-hidden="true">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+            <polyline points="22 4 12 14.01 9 11.01"/>
+          </svg>
+        </div>
+        <h3 class="end-banner-title">انتهى السحب</h3>
+        <p class="end-banner-sub">تم استخدام جميع الأسماء والألعاب</p>
+        <button class="btn btn-primary" id="endResetBtn">إعادة تعيين السحب</button>
+      </div>
+
+      <!-- Result Cards -->
+      <div class="results-row" id="resultsRow" aria-live="polite" aria-label="نتائج السحب">
+        <div class="result-card" id="personResultCard" aria-label="الشخص المختار">
+          <div class="result-card-label">الشخص المختار</div>
+          <div class="result-card-value" id="personResult">—</div>
+        </div>
+        <div class="result-card" id="gameResultCard" aria-label="اللعبة المختارة">
+          <div class="result-card-label">اللعبة المختارة</div>
+          <div class="result-card-value" id="gameResult">—</div>
+        </div>
+      </div>
+
+      <!-- History Section -->
+      <section class="history-section" aria-labelledby="historyTitle">
+        <div class="history-header">
+          <h2 class="history-title" id="historyTitle">سجل السحب</h2>
+          <div class="history-controls">
+            <div class="search-box">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+              </svg>
+              <input
+                type="search"
+                id="historySearch"
+                class="search-input"
+                placeholder="بحث في السجل..."
+                aria-label="بحث في سجل السحب"
+              />
+            </div>
+            <button class="btn btn-ghost btn-sm" id="clearHistoryBtn" aria-label="مسح السجل">مسح السجل</button>
+          </div>
+        </div>
+
+        <div class="history-table-wrapper" role="region" aria-label="جدول سجل السحب" tabindex="0">
+          <table class="history-table" id="historyTable">
+            <thead>
+              <tr>
+                <th scope="col">#</th>
+                <th scope="col">الشخص</th>
+                <th scope="col">اللعبة</th>
+                <th scope="col">الوقت</th>
+              </tr>
+            </thead>
+            <tbody id="historyBody">
+              <!-- Rows injected by JS -->
+            </tbody>
+          </table>
+          <div class="history-empty" id="historyEmpty">
+            <p>لا توجد نتائج بعد. ابدأ السحب!</p>
+          </div>
+        </div>
+      </section>
+
+    </main><!-- /main-content -->
+
+    <!-- ── Footer ───────────────────────────────────────── -->
+    <footer class="app-footer" role="contentinfo">
+      <p>لوحة السحب العشوائي &mdash; نظام السحب الاحترافي</p>
+    </footer>
+
+  </div><!-- /app-wrapper -->
+
+  <!-- ══════════════════════════════════════════════════════
+       CONFETTI CANVAS (full-screen overlay)
+  ══════════════════════════════════════════════════════ -->
+  <canvas id="confettiCanvas" aria-hidden="true"></canvas>
+
+  <!-- Scripts -->
+  <script src="config.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
